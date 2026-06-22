@@ -1,0 +1,26 @@
+# Secrets and local runtime config
+.env
+*.env
+.env.local
+
+# Generated automation outputs
+logs/
+output/
+reports/
+dist/
+
+# Python/runtime artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS/editor files
+.DS_Store
+*.tmp
+*.bak
+*~

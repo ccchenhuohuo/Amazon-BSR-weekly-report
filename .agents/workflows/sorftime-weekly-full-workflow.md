@@ -1,0 +1,163 @@
+# Sorftime 亚马逊战略周报每周自动化工作流
+
+## 调度
+
+- 执行时间：每周五 17:00，按 Asia/Shanghai 时间理解。
+- Codex cron RRULE：`FREQ=WEEKLY;BYDAY=FR;BYHOUR=17;BYMINUTE=0;BYSECOND=0`。
+- 报告日期：取运行时最近一个已经结束的周三。周五 17:00 运行时，通常使用本周三。
+- 执行范围：`灯光类`、`支架类`、`脚架类` 三个报告类目。
+- 日志位置：项目 `logs/` 或各 skill-local `logs/`，不要把运行产物写到 `.agents/skills` 根目录。
+
+## 推荐入口
+
+优先使用项目级 runner 串联三个 skill：
+
+```bash
+.agents/workflows/run_sorftime_weekly_workflow.py \
+  --date <report_date>
+```
+
+只做 dry-run 验证时：
+
+```bash
+.agents/workflows/run_sorftime_weekly_workflow.py \
+  --date <report_date> \
+  --dry-run
+```
+
+runner 只负责编排日期、顺序、Base 复制、命令执行和摘要汇总；BSR 同步、周报生成、Base 同步的业务逻辑仍由各自 skill 维护。生产运行时，runner 会在缺少某类目 Base token 时使用 `FEISHU_TEMPLATE_BASE_TOKEN` 或 `--template-base-token <BASE_TOKEN>` 指向的模板 Base 复制结构，复制后的新 token 只在进程内继续用于该类目的 Base sync。`--base-token 类目=<token>` 只作为重跑或排障时的显式覆盖。
+
+dry-run 不会真实复制 Base，因此只能校验复制请求和命名是否正确；没有真实新 token 时，后续 Base sync 会跳过。若要完整校验 Base sync，可临时传入已有测试 Base token。
+
+## Skill 串联顺序
+
+### 1. BSR 数据同步
+
+使用 `sorftime-bsr-sync`。
+
+目标：
+
+- 对三类报告涉及的所有 Sorftime 类目同步 report_date 的 Top100 BSR 数据到 Doris。
+- 必须先删后写，避免 `DUPLICATE KEY(asin, bsr_date)` append-only 重复写入。
+- 默认同步周三数据，可通过 `--weekday wednesday`、`TARGET_WEEKDAY=wednesday` 或显式 `--dates <report_date>` 实现。
+
+建议命令形态：
+
+```bash
+TARGET_WEEKDAY=wednesday .agents/skills/sorftime-bsr-sync/scripts/bsr_sync_weekly.sh --parallel --max-workers 4
+```
+
+验收：
+
+- report_date 每个目标类目有 Top100 数据。
+- 失败类目必须重试或在最终汇报中列出。
+- 不允许在未确认清理旧数据的情况下重复追加。
+
+### 2. 三类目周报生成
+
+使用 `sorftime-weekly-report`。
+
+目标：
+
+- 分别生成 `灯光类`、`支架类`、`脚架类` 的 Markdown 周趋势监测报告。
+- 默认输出到项目 `reports/` 目录；生产环境可通过 `SORFTIME_REPORT_OUTPUT_DIR` 或 runner 的 `--report-dir` 指向 Obsidian 历史周报目录：
+
+```text
+${SORFTIME_REPORT_OUTPUT_DIR}/{YYYYMMDD}{类目}周趋势监测报告.md
+```
+
+建议命令形态：
+
+```bash
+python3 .agents/skills/sorftime-weekly-report/scripts/generate_weekly_report.py --category 灯光类 --date <report_date> --overwrite
+python3 .agents/skills/sorftime-weekly-report/scripts/generate_weekly_report.py --category 支架类 --date <report_date> --overwrite
+python3 .agents/skills/sorftime-weekly-report/scripts/generate_weekly_report.py --category 脚架类 --date <report_date> --overwrite
+```
+
+验收：
+
+- 运行 `validate_report.py` 校验三份报告。
+- 价格必须按美分转美元。
+- SQL 排名字段必须使用 `bsr_rank`。
+- 不允许保留“数据待补充”等占位内容。
+- ULANZI 0 SKU 是合法状态，但报告必须明确写出无产品进入 TOP100。
+
+### 3. 报告数据同步到飞书 Base
+
+使用 `sorftime-report-base-sync`，涉及 Base 操作时同时使用 `lark-base`。
+
+目标：
+
+- 为三份报告复制或准备目标 Base。
+- 将报告中的带图商品表同步到三张母表和 12 张子表。
+- 校验目标 Base 的 grid 视图集合与字段顺序完全沿用模板；模板没有筛选视图，因此脚本不得创建筛选视图。
+
+建议命令形态：
+
+```bash
+python3 .agents/skills/sorftime-report-base-sync/scripts/sync_report_to_base.py \
+  --report "/path/to/{YYYYMMDD}灯光类周趋势监测报告.md" \
+  --base-token <BASE_TOKEN> \
+  --template-base-token <TEMPLATE_BASE_TOKEN> \
+  --category 灯光类 \
+  --date <report_date> \
+  --overwrite \
+  --rename-folders
+```
+
+验收：
+
+- 三张母表记录数正确：`异动数据`、`低分高销数据`、`本品数据`。
+- 12 张子表记录数与母表过滤结果一致。
+- 按业务键检查无重复。
+- `商品图片` 为纯 `https://...` URL，不包含 `<img`。
+- ASIN 是 Markdown Amazon 链接。
+- 新上榜记录的 `上周排名` 和 `排名变化` 为空，非新上榜记录的 `是否新品` 为空。
+- `field_order.changed_views` 已汇总本次修正过的视图；抽查目标视图的 `view-get-visible-fields`，应与模板同名视图顺序一致；目标 Base 不应出现模板没有的额外筛选视图。
+- `folder_rename` 与 `block_layout` 已输出，左侧 `{类目1}` / `{类目2}` 分组通过 CLI 改名并回读校验；若缺 `base:block:update` scope，必须标为阻塞。
+- `server_verification` 已回读目标 Base，记录数、重复检查、图片 URL 和 ASIN 链接均通过。
+
+### 4. Base 左侧分组名称 CLI 处理
+
+新版 `lark-cli base +base-block-list/+base-block-rename` 已支持读取和重命名飞书 Base 左侧表分组/文件夹。生产自动化默认由 Base sync 脚本用 CLI 完成，不再依赖 Chrome/Computer Use 页面操作。
+
+必须把根级 folder 分组改为：
+
+| 报告类目 | `{类目1}` 应改为 | `{类目2}` 应改为 |
+| --- | --- | --- |
+| 灯光类 | Continuous Output Lighting | Selfie Lights |
+| 支架类 | Cradles | Grips |
+| 脚架类 | Complete Tripods | Tripods |
+
+验收：
+
+- `lark-cli base +base-block-list --type folder` 回读不再出现 `{类目1}`、`{类目2}`。
+- `block_layout.table_parent_checks` 确认 12 张章节子表仍在正确 folder 下，三张母表仍在根级。
+- 若 `+base-block-rename --dry-run` 返回缺少 `base:block:update`，最终汇报必须明确标为阻塞，并提示授权命令。
+- 不要删除或重建文件夹，不要移动表，除非用户明确要求。Chrome/Computer Use 只作为 CLI 不可用或人工排障时的 fallback。
+
+## 最终汇报
+
+每次自动化结束后，最终回复至少包含：
+
+- report_date。
+- 三份 Markdown 报告路径。
+- 三份 Base 准备状态；本地日志只记录 token 是否存在，不记录真实 token。
+- 三张母表和 12 张子表记录数。
+- 重复检查、图片检查、ASIN 检查结果。
+- Base 左侧分组 CLI 重命名状态、block layout 校验状态和缺 scope 阻塞信息。
+- 需要用户手工插入战略报告文档的 Base 子表清单，或说明该步骤仍受飞书文档 API 限制。
+
+## 当前限制与迭代项
+
+- Codex 定时任务必须通过 `automation_update` 注册。不要手写 `~/.codex/automations` 配置作为替代；如果工具返回 `No handler registered for tool: automation_update`，说明当前 Codex App 会话没有挂载自动化 handler，需要在 App/工具层恢复后再注册。
+- Base 复制/目标 token 准备仍是链路中最需要显式记录的步骤。自动化执行时必须在最终汇报中列出每个类目对应的 Base 准备状态；真实 token 不写入仓库、summary 或 run-report。
+- Base 左侧分组名已改为优先 CLI 处理；需要 `lark-cli >= 1.0.56` 和 `base:block:update` 授权。
+- 已新增 project-level runner：`.agents/workflows/run_sorftime_weekly_workflow.py`。runner 在生产运行时会自动从模板 Base 复制三份新 Base 并回填 token，并会生成 `logs/sorftime-weekly-workflow/{run_id}/summary.json` 与 `run-report.md`。
+- runner 会解析 Base sync 末尾 JSON，结构化汇总三张母表、十二张子表记录数、重复检查结果和 Base sync 日志目录。
+- ProductRequest 旁路流程已修复两个审查问题：`transform_product.py` 不再输出 Stream Load columns 之外的 `photo` 字段；`DatabaseConfig` 直接构造时 `stream_load_host` 会回退到 `host`。注意：最终周报和 Base 的 `商品图片` URL 来自 CategoryRequest 同步后的配置表 `photo` 字段，不是 ProductRequest 旁路表。
+- Chrome/Computer Use 左侧分组重命名保留为人工 fallback，不作为默认自动化步骤。
+
+## Codex 自动化提示词
+
+创建 Codex 定时自动化时，提示词应引用本 workflow，并要求按顺序使用 `sorftime-bsr-sync`、`sorftime-weekly-report`、`sorftime-report-base-sync`。自动化任务必须用 `folder_rename` / `block_layout` 汇报左侧分组状态；若缺少 `base:block:update` 授权，必须把该项标为阻塞并说明授权恢复命令。

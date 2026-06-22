@@ -1,0 +1,23 @@
+[project]
+name = "amazon-strategic-weekly-report"
+version = "0.1.0"
+description = "Codex automation for weekly Amazon/Sorftime strategic reports."
+requires-python = ">=3.11"
+dependencies = [
+    "DBUtils>=3.0.0",
+    "charset-normalizer>=3.3,<3.4",
+    "pymysql>=1.1.1",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31,<2.34",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = [
+    ".agents/skills/sorftime-report-base-sync/tests",
+    "tests",
+]
