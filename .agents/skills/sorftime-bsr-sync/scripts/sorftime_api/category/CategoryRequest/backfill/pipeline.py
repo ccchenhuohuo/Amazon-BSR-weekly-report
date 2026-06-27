@@ -98,7 +98,7 @@ def _fetch_and_transform(
     """
     # Step 1: fetch_bsr.py -> stdout
     p1 = subprocess.Popen(
-        ["python3", str(fetch_script), "--date", date_str, "--node-id", node_id],
+        [sys.executable, str(fetch_script), "--date", date_str, "--node-id", node_id],
         stdout=subprocess.PIPE,
         stderr=sys.stderr,
         text=True
@@ -106,7 +106,7 @@ def _fetch_and_transform(
 
     # Step 2: transform_bsr.py <- stdin, -> stdout
     p2 = subprocess.Popen(
-        ["python3", str(transform_script), "--date", date_str],
+        [sys.executable, str(transform_script), "--date", date_str],
         stdin=p1.stdout,
         stdout=subprocess.PIPE,
         stderr=sys.stderr,

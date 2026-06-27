@@ -67,6 +67,8 @@ DEFAULT_TEMPLATE_BASE_TOKEN = os.environ.get("FEISHU_TEMPLATE_BASE_TOKEN", "")
 OWN_TABLES = {"本品数据", "4.1.1", "4.1.2"}
 LARK_CLI_BIN = os.environ.get("LARK_CLI_BIN", "lark-cli")
 LARK_CLI_TIMEOUT_SECONDS = int(os.environ.get("LARK_CLI_TIMEOUT_SECONDS", "240"))
+BASE_VERIFY_MAX_ATTEMPTS = int(os.environ.get("BASE_VERIFY_MAX_ATTEMPTS", "6"))
+BASE_VERIFY_RETRY_DELAY_SECONDS = int(os.environ.get("BASE_VERIFY_RETRY_DELAY_SECONDS", "15"))
 SECRET_FLAGS = {"--base-token", "--template-base-token", "--folder-token"}
 SECRET_OUTPUT_KEYS = (
     "app_token",
@@ -1219,8 +1221,21 @@ def list_records(base_token: str, table_id: str) -> list[dict[str, Any]]:
         )
         payload = data.get("data", {})
         rows = payload.get("data") or payload.get("records") or payload.get("items") or []
+        field_names = payload.get("fields") or []
+        record_ids = payload.get("record_id_list") or []
         if isinstance(rows, list):
-            records.extend(row for row in rows if isinstance(row, dict))
+            for idx, row in enumerate(rows):
+                if isinstance(row, dict):
+                    records.append(row)
+                elif isinstance(row, list) and field_names:
+                    fields = {
+                        field_name: row[field_idx]
+                        for field_idx, field_name in enumerate(field_names[: len(row)])
+                    }
+                    record: dict[str, Any] = {"fields": fields}
+                    if idx < len(record_ids):
+                        record["record_id"] = record_ids[idx]
+                    records.append(record)
         if not payload.get("has_more"):
             break
         offset += 200
@@ -1243,43 +1258,59 @@ def verify_written_records(
     if not overwrite:
         return {"status": "skipped_non_overwrite", "expected_counts": expected_counts, "actual_counts": {}, "issues": [], "duplicates": {}}
 
-    actual_counts: dict[str, int] = {}
-    issues: list[str] = []
-    duplicates: dict[str, list[tuple[Any, ...]]] = {}
     duplicate_specs = {
         "异动数据": ["ASIN", "类目", "数据类型"],
         "低分高销数据": ["ASIN", "类目"],
         "本品数据": ["ASIN", "类目"],
     }
 
-    for table_name in REQUIRED_TABLES:
-        records = list_records(base_token, tables[table_name])
-        actual_counts[table_name] = len(records)
-        expected = expected_counts.get(table_name, 0)
-        if len(records) != expected:
-            issues.append(f"{table_name}: expected {expected} records, got {len(records)}")
+    attempts = max(1, BASE_VERIFY_MAX_ATTEMPTS)
+    actual_counts: dict[str, int] = {}
+    issues: list[str] = []
+    duplicates: dict[str, list[tuple[Any, ...]]] = {}
 
-        seen: set[tuple[Any, ...]] = set()
-        table_duplicates: list[tuple[Any, ...]] = []
-        duplicate_keys = duplicate_specs.get(table_name)
-        for idx, record in enumerate(records, start=1):
-            fields = record_fields(record)
-            img = cell_text(fields.get("商品图片"))
-            asin = cell_text(fields.get("ASIN"))
-            if img and (not img.startswith("https://") or "<img" in img):
-                issues.append(f"{table_name} row {idx}: invalid image {img}")
-            if asin and not re.fullmatch(r"\[[A-Z0-9]{10}\]\(https://www\.amazon\.com/dp/[A-Z0-9]{10}\)", asin):
-                issues.append(f"{table_name} row {idx}: invalid ASIN link {asin}")
-            if duplicate_keys:
-                key = tuple(cell_text(fields.get(name)) for name in duplicate_keys)
-                if key in seen:
-                    table_duplicates.append(key)
-                seen.add(key)
-        if table_duplicates:
-            duplicates[table_name] = table_duplicates
+    for attempt in range(1, attempts + 1):
+        actual_counts = {}
+        issues = []
+        duplicates = {}
 
-    if duplicates:
-        issues.append("Duplicate business keys found in " + ", ".join(sorted(duplicates)))
+        for table_name in REQUIRED_TABLES:
+            records = list_records(base_token, tables[table_name])
+            actual_counts[table_name] = len(records)
+            expected = expected_counts.get(table_name, 0)
+            if len(records) != expected:
+                issues.append(f"{table_name}: expected {expected} records, got {len(records)}")
+
+            seen: set[tuple[Any, ...]] = set()
+            table_duplicates: list[tuple[Any, ...]] = []
+            duplicate_keys = duplicate_specs.get(table_name)
+            for idx, record in enumerate(records, start=1):
+                fields = record_fields(record)
+                img = cell_text(fields.get("商品图片"))
+                asin = cell_text(fields.get("ASIN"))
+                if img and (not img.startswith("https://") or "<img" in img):
+                    issues.append(f"{table_name} row {idx}: invalid image {img}")
+                if asin and not re.fullmatch(r"\[[A-Z0-9]{10}\]\(https://www\.amazon\.com/dp/[A-Z0-9]{10}\)", asin):
+                    issues.append(f"{table_name} row {idx}: invalid ASIN link {asin}")
+                if duplicate_keys:
+                    key = tuple(cell_text(fields.get(name)) for name in duplicate_keys)
+                    if key in seen:
+                        table_duplicates.append(key)
+                    seen.add(key)
+            if table_duplicates:
+                duplicates[table_name] = table_duplicates
+
+        if duplicates:
+            issues.append("Duplicate business keys found in " + ", ".join(sorted(duplicates)))
+        if not issues or attempt == attempts:
+            break
+
+        log_progress(
+            "record verification mismatch "
+            f"(attempt {attempt}/{attempts}); retrying in {BASE_VERIFY_RETRY_DELAY_SECONDS}s"
+        )
+        time.sleep(max(0, BASE_VERIFY_RETRY_DELAY_SECONDS))
+
     return {
         "status": "ok" if not issues else "failed",
         "expected_counts": expected_counts,

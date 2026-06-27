@@ -556,3 +556,105 @@ def test_verify_written_records_reads_back_counts_and_cells(monkeypatch):
     assert result["status"] == "ok"
     assert result["actual_counts"]["异动数据"] == 1
     assert result["issues"] == []
+
+
+def test_verify_written_records_retries_until_server_counts_match(monkeypatch):
+    rows = {
+        "异动数据": [
+            {
+                "fields": {
+                    "ASIN": "[X012345678](https://www.amazon.com/dp/X012345678)",
+                    "类目": "Continuous Output Lighting",
+                    "数据类型": "TOP10产品",
+                    "商品图片": "https://example.com/a.jpg",
+                }
+            }
+        ],
+        "低分高销数据": [],
+        "本品数据": [],
+    }
+    for table_name in sync_report_to_base.REQUIRED_TABLES:
+        rows.setdefault(table_name, [])
+
+    tables = table_ids()
+    id_to_name = {table_id: table_name for table_name, table_id in tables.items()}
+    calls = []
+
+    def fake_run_cli(args, dry_run=False, allow_failure=False):
+        table_id = args[args.index("--table-id") + 1]
+        table_name = id_to_name[table_id]
+        calls.append(table_name)
+        if len(calls) <= len(sync_report_to_base.REQUIRED_TABLES):
+            return {"ok": True, "data": {"data": [], "has_more": False}}
+        return {"ok": True, "data": {"data": rows[table_name], "has_more": False}}
+
+    monkeypatch.setattr(sync_report_to_base, "run_cli", fake_run_cli)
+    monkeypatch.setattr(sync_report_to_base, "BASE_VERIFY_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(sync_report_to_base, "BASE_VERIFY_RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(sync_report_to_base.time, "sleep", lambda seconds: None)
+    expected = {name: len(rows[name]) for name in sync_report_to_base.REQUIRED_TABLES}
+
+    result = sync_report_to_base.verify_written_records(
+        "base",
+        tables,
+        expected,
+        dry_run=False,
+        prepare_only=False,
+        overwrite=True,
+    )
+
+    assert result["status"] == "ok"
+    assert result["actual_counts"]["异动数据"] == 1
+    assert len(calls) == len(sync_report_to_base.REQUIRED_TABLES) * 2
+
+
+def test_list_records_converts_lark_cli_array_rows_to_field_dicts(monkeypatch):
+    def fake_run_cli(args, dry_run=False, allow_failure=False):
+        assert args[:2] == ["base", "+record-list"]
+        return {
+            "ok": True,
+            "data": {
+                "data": [
+                    [
+                        1,
+                        "https://example.com/a.jpg",
+                        "[X012345678](https://www.amazon.com/dp/X012345678)",
+                        ["Continuous Output Lighting"],
+                    ],
+                    [
+                        2,
+                        "https://example.com/b.jpg",
+                        "[X087654321](https://www.amazon.com/dp/X087654321)",
+                        ["Selfie Lights"],
+                    ],
+                ],
+                "fields": ["排名", "商品图片", "ASIN", "类目"],
+                "record_id_list": ["rec-a", "rec-b"],
+                "has_more": False,
+            },
+        }
+
+    monkeypatch.setattr(sync_report_to_base, "run_cli", fake_run_cli)
+
+    records = sync_report_to_base.list_records("base", "tbl")
+
+    assert records == [
+        {
+            "record_id": "rec-a",
+            "fields": {
+                "排名": 1,
+                "商品图片": "https://example.com/a.jpg",
+                "ASIN": "[X012345678](https://www.amazon.com/dp/X012345678)",
+                "类目": ["Continuous Output Lighting"],
+            },
+        },
+        {
+            "record_id": "rec-b",
+            "fields": {
+                "排名": 2,
+                "商品图片": "https://example.com/b.jpg",
+                "ASIN": "[X087654321](https://www.amazon.com/dp/X087654321)",
+                "类目": ["Selfie Lights"],
+            },
+        },
+    ]

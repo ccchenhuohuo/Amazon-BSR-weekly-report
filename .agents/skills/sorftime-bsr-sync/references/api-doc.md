@@ -14,7 +14,7 @@ data here.
 ## Authentication
 
 - Base URL: `https://standardapi.sorftime.com/api`
-- Authentication header: `Authorization: BasicAuth ${SORFTIME_API_KEY}`
+- Authentication header: `Authorization` uses the `BasicAuth` scheme with the configured Sorftime API key.
 - Content type: `application/json;charset=UTF-8`
 - The real `SORFTIME_API_KEY` must be provided through the runtime environment
   or a local `.env` file that is ignored by Git.

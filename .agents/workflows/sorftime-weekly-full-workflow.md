@@ -25,9 +25,9 @@
   --dry-run
 ```
 
-runner 只负责编排日期、顺序、Base 复制、命令执行和摘要汇总；BSR 同步、周报生成、Base 同步的业务逻辑仍由各自 skill 维护。生产运行时，runner 会在缺少某类目 Base token 时使用 `FEISHU_TEMPLATE_BASE_TOKEN` 或 `--template-base-token <BASE_TOKEN>` 指向的模板 Base 复制结构，复制后的新 token 只在进程内继续用于该类目的 Base sync。`--base-token 类目=<token>` 只作为重跑或排障时的显式覆盖。
+runner 只负责编排日期、顺序、Base 复制、命令执行和摘要汇总；BSR 同步、周报生成、Base 同步的业务逻辑仍由各自 skill 维护。生产运行时，runner 会在缺少某类目 Base token 时使用 `FEISHU_TEMPLATE_BASE_TOKEN` 或 `--template-base-token <BASE_TOKEN>` 指向的模板 Base 复制结构，复制后的新 token 只在进程内继续用于该类目的 Base sync。`--base-token 类目=<token>` 只作为重跑或排障时的显式覆盖。Base sync 成功后，runner 会在对应 Base 左侧栏新增一份 docx 文档，并把本类目的周报正文写入该 Base 内文档。
 
-dry-run 不会真实复制 Base，因此只能校验复制请求和命名是否正确；没有真实新 token 时，后续 Base sync 会跳过。若要完整校验 Base sync，可临时传入已有测试 Base token。
+dry-run 不会真实复制 Base，因此只能校验复制请求和命名是否正确；没有真实新 token 时，后续 Base sync 会跳过。若要完整校验 Base sync，可临时传入已有测试 Base token。dry-run 默认不发送飞书完成通知；需要测试通知时显式加 `--notify-dry-run`。
 
 ## Skill 串联顺序
 
@@ -136,6 +136,72 @@ python3 .agents/skills/sorftime-report-base-sync/scripts/sync_report_to_base.py 
 - 若 `+base-block-rename --dry-run` 返回缺少 `base:block:update`，最终汇报必须明确标为阻塞，并提示授权命令。
 - 不要删除或重建文件夹，不要移动表，除非用户明确要求。Chrome/Computer Use 只作为 CLI 不可用或人工排障时的 fallback。
 
+### 5. Base 左侧栏内周报文档
+
+runner 会在每个目标 Base 左侧栏创建 docx 类型块：
+
+```bash
+lark-cli base +base-block-create --base-token <BASE_TOKEN> --type docx --name <YYYYMMDD类目周趋势监测报告> --as user
+```
+
+随后通过 `lark-cli docs +update --api-version v2 --command overwrite --doc-format markdown` 写入周报正文。写入前必须处理两类内容：
+
+- 去掉 Markdown YAML front matter，避免飞书文档正文开头出现元数据。
+- 把远程 `<img ...>` 标签替换为 `图片见 Base 数据表`，避免文档导入图片超时或部分写入；商品图片以 Base 表格为准。
+
+验收：
+
+- Base 左侧栏能看到对应类目的周报文档。
+- 云文档正文从标题和第一节开始，不得从第三节或中间章节开始。
+- 文档链接和 Base 链接都应出现在最终通知中。
+
+### 6. 飞书完成通知
+
+runner 结束后会发送一条飞书 markdown 消息。收件人通过本地 `.env` 或环境变量配置：
+
+```bash
+FEISHU_NOTIFY_USER_ID=ou_xxx
+# 或
+FEISHU_NOTIFY_CHAT_ID=oc_xxx
+FEISHU_NOTIFY_AS=bot
+FEISHU_REQUIRE_NOTIFY=1
+```
+
+`FEISHU_NOTIFY_CHAT_ID` 和 `FEISHU_NOTIFY_USER_ID` 同时存在时优先发到群聊。生产环境应设置 `FEISHU_REQUIRE_NOTIFY=1`，这样未配置收件人或通知未确认投递都会让 `notify:feishu` 标记为 failed，并使 workflow 非零退出。dry-run 默认不发送通知；显式加 `--notify-dry-run` 时才会测试通知链路。
+
+成功模板固定为：
+
+```text
+【Amazon BSR 战略周报】已完成
+
+报告日期：{report_date}
+运行结果：{success_count}/3 类目成功
+完成时间：{finished_at}
+
+链接：
+灯光类：[多维表格]({lighting_base_url}) ｜ [周报文档]({lighting_doc_url})
+支架类：[多维表格]({mount_base_url}) ｜ [周报文档]({mount_doc_url})
+脚架类：[多维表格]({tripod_base_url}) ｜ [周报文档]({tripod_doc_url})
+
+说明：周报文档已新增到对应多维表格左侧栏；商品图片见 Base 数据表。
+```
+
+异常模板固定为：
+
+```text
+【Amazon BSR 战略周报】运行异常
+
+报告日期：{report_date}
+运行结果：{success_count}/3 类目成功
+失败环节：{failed_steps}
+完成时间：{finished_at}
+
+已生成链接：
+{generated_links}
+
+排查日志：{run_report_path}
+```
+
 ## 最终汇报
 
 每次自动化结束后，最终回复至少包含：
@@ -146,15 +212,18 @@ python3 .agents/skills/sorftime-report-base-sync/scripts/sync_report_to_base.py 
 - 三张母表和 12 张子表记录数。
 - 重复检查、图片检查、ASIN 检查结果。
 - Base 左侧分组 CLI 重命名状态、block layout 校验状态和缺 scope 阻塞信息。
-- 需要用户手工插入战略报告文档的 Base 子表清单，或说明该步骤仍受飞书文档 API 限制。
+- Base 左侧栏内周报文档创建/写入状态。
+- 飞书完成通知发送状态；若未配置收件人，明确标记为 skipped。
 
 ## 当前限制与迭代项
 
 - Codex 定时任务必须通过 `automation_update` 注册。不要手写 `~/.codex/automations` 配置作为替代；如果工具返回 `No handler registered for tool: automation_update`，说明当前 Codex App 会话没有挂载自动化 handler，需要在 App/工具层恢复后再注册。
 - Base 复制/目标 token 准备仍是链路中最需要显式记录的步骤。自动化执行时必须在最终汇报中列出每个类目对应的 Base 准备状态；真实 token 不写入仓库、summary 或 run-report。
-- Base 左侧分组名已改为优先 CLI 处理；需要 `lark-cli >= 1.0.56` 和 `base:block:update` 授权。
+- Base 左侧分组名已改为优先 CLI 处理；需要 `lark-cli >= 1.0.56` 和 `base:block:update` 授权。cron 环境应在 `.env` 中使用绝对 `LARK_CLI_BIN=/usr/local/bin/lark-cli`，并设置可访问授权缓存的 `LARKSUITE_CLI_DATA_DIR`。
+- 新增 Base 内文档和通知链路依赖：Base/Doc 操作用 user 身份，至少需要 `base:block:create`、`base:block:read`、`base:block:update`、`docx:document:write_only`；通知默认用 bot 身份，需要 `im:message`，若改用 user 身份则需要对应 user 发送 scope。授权失效时先用 `lark-cli auth status --json` 和 `lark-cli auth login --scope <scope> --no-wait --json` 处理。
 - 已新增 project-level runner：`.agents/workflows/run_sorftime_weekly_workflow.py`。runner 在生产运行时会自动从模板 Base 复制三份新 Base 并回填 token，并会生成 `logs/sorftime-weekly-workflow/{run_id}/summary.json` 与 `run-report.md`。
 - runner 会解析 Base sync 末尾 JSON，结构化汇总三张母表、十二张子表记录数、重复检查结果和 Base sync 日志目录。
+- runner 会在 Base 左侧栏新增周报 docx 文档，并在流程结束后通过飞书机器人发送完成/异常通知。
 - ProductRequest 旁路流程已修复两个审查问题：`transform_product.py` 不再输出 Stream Load columns 之外的 `photo` 字段；`DatabaseConfig` 直接构造时 `stream_load_host` 会回退到 `host`。注意：最终周报和 Base 的 `商品图片` URL 来自 CategoryRequest 同步后的配置表 `photo` 字段，不是 ProductRequest 旁路表。
 - Chrome/Computer Use 左侧分组重命名保留为人工 fallback，不作为默认自动化步骤。
 

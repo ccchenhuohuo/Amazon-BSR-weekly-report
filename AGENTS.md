@@ -22,5 +22,5 @@ Do not move these Sorftime weekly-report skills back to a user-level skills dire
 - Use `sorftime-bsr-sync` for Sorftime API to Doris sync work.
 - Use `sorftime-weekly-report` for weekly trend report generation.
 - Use `sorftime-report-base-sync` after report generation when the Markdown/Obsidian report's image-bearing product tables need to be synced into Feishu Base mother tables and split child tables.
-- For the recurring Friday 17:00 weekly run, follow `.agents/workflows/sorftime-weekly-full-workflow.md`: sync Wednesday BSR data first, generate all three category reports, then sync each report to Feishu Base and visually verify the Base left-sidebar category folder names.
+- For the recurring Friday 17:00 weekly run, follow `.agents/workflows/sorftime-weekly-full-workflow.md`: sync Wednesday BSR data first, generate all three category reports, sync each report to Feishu Base, verify the Base left-sidebar folder state through CLI output, create the weekly report docx inside each Base sidebar, and send the final Feishu notification.
 - Keep generated logs under project or skill-local `logs/` directories; do not place generated outputs directly under `.agents/skills` unless they are skill resources.
