@@ -147,13 +147,13 @@ class DatabaseConfig:
 class BackfillConfig:
     max_workers: int = 4
     start_date: str = '2026-01-01'
-    target_weekday: int = 4  # FRIDAY (0=Monday, 4=Friday, 6=Sunday)
+    target_weekday: int = 2  # WEDNESDAY (0=Monday, 2=Wednesday, 6=Sunday)
 
     @classmethod
     def from_env(cls):
         max_workers_str = os.environ.get('MAX_WORKERS', '4')
         start_date = os.environ.get('START_DATE', '2026-01-01')
-        target_weekday_str = os.environ.get('TARGET_WEEKDAY', 'friday')
+        target_weekday_str = os.environ.get('TARGET_WEEKDAY', 'wednesday')
 
         try:
             max_workers = int(max_workers_str)

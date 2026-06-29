@@ -23,6 +23,8 @@ Use Python 3.11 or newer.
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
+# or pin to the verified production set
+pip install -r requirements.lock
 ```
 
 Create local runtime configuration:
@@ -39,6 +41,7 @@ Base tokens, internal hosts, and generated logs must never be committed.
 ```bash
 python3 .agents/skills/sorftime-weekly-report/scripts/generate_weekly_report.py --preflight
 python3 .agents/skills/sorftime-bsr-sync/scripts/sorftime_api/category/CategoryRequest/fill_missing.py --help
+python3 .agents/workflows/run_sorftime_weekly_workflow.py --preflight
 python3 .agents/workflows/run_sorftime_weekly_workflow.py --date 2026-06-17 --dry-run --skip-bsr --skip-report --skip-base-sync
 pytest
 ```
@@ -71,6 +74,26 @@ writes the Markdown report into that in-Base document. Remote product image tags
 are replaced with `图片见 Base 数据表` in the docx content; the image-bearing
 tables remain in Base.
 
+Publication is idempotent by default. The runner records per-date/per-category
+Base and docx tokens in the ignored local registry `state/publications.json`
+with file mode `600`. On rerun it reuses the registered Base/docx and updates
+the existing in-Base report document after confirming the same-named docx still
+exists in the Base sidebar. Use `--force-new-publication` only when a fresh set
+of Feishu resources is intentionally required.
+
+The scheduled BSR sync does not force-refresh complete Doris data. Existing
+date/category rows with the expected Top 100 count are skipped unless the BSR
+tool is run explicitly with `--force`. Forced refreshes back up old rows before
+DELETE and attempt restoration if load or verification fails.
+
+Markdown report files are written atomically: render to a same-directory
+temporary file, validate that file, then replace the final path. A validation
+failure leaves the previous report intact.
+
+Base overwrite sync takes a local snapshot before clearing records. If a write
+or readback verification fails, the sync attempts to restore the snapshot and
+exits non-zero with `overwrite_recovery` details in the JSON summary.
+
 To send the final Feishu notification, set one recipient locally:
 
 ```bash
@@ -80,6 +103,9 @@ FEISHU_NOTIFY_CHAT_ID=oc_xxx
 FEISHU_NOTIFY_AS=bot
 FEISHU_REQUIRE_NOTIFY=1
 ```
+
+Legacy `LARK_REPORT_USER_ID` and `LARK_REPORT_CHAT_ID` are still accepted as
+fallbacks, but the `FEISHU_NOTIFY_*` names take precedence.
 
 For cron, use an absolute `LARK_CLI_BIN` path such as
 `/usr/local/bin/lark-cli` and keep `LARKSUITE_CLI_DATA_DIR` pointed at the data
@@ -106,14 +132,17 @@ order:
 
 1. Sync Wednesday BSR data.
 2. Generate the three category Markdown reports.
-3. Sync each report to Feishu Base.
-4. Create and update the weekly report docx inside each Base sidebar.
-5. Send the final Feishu notification with Base and docx links.
+3. Reuse registered Feishu Bases or copy from the template when missing.
+4. Sync each report to Feishu Base with overwrite snapshots and verification.
+5. Reuse or create the weekly report docx inside each Base sidebar, then update it.
+6. Send the final Feishu notification with Base and docx links.
 
-The local cron command should set a restrictive umask before creating logs:
+The local cron command should call the wrapper, which sets a restrictive umask,
+keeps `logs/cron` at `700`, keeps `cron.log` at `600`, and writes an explicit
+skip line when the lock is already held:
 
 ```text
-0 17 * * 5 cd /opt/ulanzi/report/Amazon-BSR-weekly-report && umask 077 && mkdir -p logs/cron && flock -n /tmp/amazon-bsr-weekly-report.lock .venv/bin/python .agents/workflows/run_sorftime_weekly_workflow.py >> logs/cron/cron.log 2>&1
+0 17 * * 5 /opt/ulanzi/report/Amazon-BSR-weekly-report/.agents/workflows/run_sorftime_weekly_cron.sh
 ```
 
 ## Safety Boundary
@@ -121,7 +150,7 @@ The local cron command should set a restrictive umask before creating logs:
 Before publishing or pushing:
 
 ```bash
-find . -type l
+find . -path './.venv' -prune -o -path './logs' -prune -o -path './reports' -prune -o -type l -print
 find . -type d -name .git
 rg -n --hidden -g '!README.md' -g '!tests/**' -g '!**/tests/**' \
   -g '!logs/**' -g '!reports/**' -g '!output/**' -g '!dist/**' \

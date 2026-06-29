@@ -812,8 +812,24 @@ def main() -> None:
         out_path = args.out_dir / "_tmp" / f"{target_path.stem}-{timestamp}{target_path.suffix}"
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    out_path.write_text(report, encoding="utf-8")
-    validate(out_path, args.category, a["name"], b["name"], image_width=IMAGE_WIDTH)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=out_path.parent,
+            prefix=f".{out_path.stem}.",
+            suffix=f"{out_path.suffix}.tmp",
+            delete=False,
+        ) as temp_file:
+            temp_file.write(report)
+            temp_path = Path(temp_file.name)
+        validate(temp_path, args.category, a["name"], b["name"], image_width=IMAGE_WIDTH)
+        os.replace(temp_path, out_path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
     print_summary({
         "status": "REPORT_CONFLICT_TEMP_OK" if conflict else "REPORT_OK",
         "category": args.category,

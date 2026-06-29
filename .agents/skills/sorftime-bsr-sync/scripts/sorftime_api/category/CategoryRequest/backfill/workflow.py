@@ -7,11 +7,13 @@ BSR 数据同步核心工作流
 import os
 import re
 import sys
+import json
 import threading
 import logging
 from typing import Optional, List, Tuple, Any, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from datetime import datetime
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[4]
 if str(SCRIPTS_DIR) not in sys.path:
@@ -74,6 +76,42 @@ class CategoryBSRWorkflow:
         # 数据库连接池（懒加载，线程安全）
         self._db_pool: Optional[Any] = None
         self._db_pool_lock = threading.Lock()
+        self._task_statuses: Dict[str, Dict[str, Any]] = {}
+        self._task_status_lock = threading.Lock()
+
+    def _record_task_status(self, task_str: str, **values: Any) -> None:
+        if not hasattr(self, "_task_statuses"):
+            self._task_statuses = {}
+        if not hasattr(self, "_task_status_lock"):
+            self._task_status_lock = threading.Lock()
+        with self._task_status_lock:
+            current = self._task_statuses.setdefault(task_str, {})
+            current.update(values)
+
+    def _task_status_summary(self) -> Dict[str, Any]:
+        if not hasattr(self, "_task_statuses"):
+            return {"skipped_existing": [], "backups": {}, "restore_status": {}}
+        with self._task_status_lock:
+            statuses = dict(self._task_statuses)
+        return {
+            "skipped_existing": [
+                task for task, status in statuses.items() if status.get("skipped_existing")
+            ],
+            "backups": {
+                task: {
+                    "status": status.get("backup_status"),
+                    "path": status.get("backup_path"),
+                    "rows": status.get("backup_rows"),
+                }
+                for task, status in statuses.items()
+                if "backup_status" in status
+            },
+            "restore_status": {
+                task: status.get("restore_status")
+                for task, status in statuses.items()
+                if "restore_status" in status
+            },
+        }
 
     def set_node_ids(self, node_ids: List[str]):
         """
@@ -240,6 +278,82 @@ class CategoryBSRWorkflow:
         except (pymysql.Error, OSError) as e:
             self.logger.error(f"查询 Doris 失败: {e}")
             return 0
+
+    def _select_existing_rows(self, date_str: str, node_id: str) -> List[Dict[str, Any]]:
+        """Read existing rows before a destructive refresh."""
+        import pymysql
+        table_ref = self._build_table_ref()
+        try:
+            return self._exec_query(
+                f"""
+                SELECT {self._columns}
+                FROM {table_ref}
+                WHERE bsr_date = %s AND bsr_category_node = %s
+                ORDER BY bsr_rank
+                """,
+                (date_str, node_id),
+            )
+        except (pymysql.Error, OSError) as e:
+            self.logger.error(f"备份前查询 Doris 失败: {e}")
+            raise RuntimeError("backup query failed") from e
+
+    def _backup_existing_rows(self, date_str: str, node_id: str) -> tuple[List[Dict[str, Any]], Optional[Path]]:
+        rows = self._select_existing_rows(date_str, node_id)
+        if not rows:
+            self.logger.info(f"备份跳过：无旧数据 date={date_str}, node_id={node_id}")
+            return rows, None
+        backup_dir = get_skill_dir() / "logs" / "bsr-sync" / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(backup_dir, 0o700)
+        backup_path = backup_dir / (
+            f"{date_str}-{node_id}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}.json"
+        )
+        backup_path.write_text(json.dumps(rows, ensure_ascii=False, default=str, indent=2), encoding="utf-8")
+        os.chmod(backup_path, 0o600)
+        self.logger.info(f"已备份旧数据: date={date_str}, node_id={node_id}, rows={len(rows)}, path={backup_path}")
+        return rows, backup_path
+
+    def _restore_backup_rows(
+        self,
+        date_str: str,
+        node_id: str,
+        backup_rows: List[Dict[str, Any]],
+        backup_path: Optional[Path],
+    ) -> bool:
+        if not backup_rows:
+            self.logger.warning(f"没有可恢复的旧数据: date={date_str}, node_id={node_id}")
+            return False
+        task_str = f"{date_str}+{node_id}"
+        self.logger.warning(f"开始恢复旧数据: task={task_str}, rows={len(backup_rows)}, backup={backup_path}")
+        if not self._delete_old_data(date_str, node_id):
+            self.logger.error(f"恢复失败：无法清理当前残留数据 task={task_str}")
+            return False
+        label = (
+            f"bsr_restore_{node_id}_{date_str.replace('-', '')}_"
+            f"{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        )
+        restored = _call_stream_load_direct(
+            host=self._db_config.stream_load_host,
+            port=self._db_config.stream_load_port,
+            fallback_host=self._db_config.stream_load_fallback_host,
+            fallback_port=self._db_config.stream_load_fallback_port,
+            user=self._db_config.user,
+            password=self._db_config.password,
+            database=self._db_config.database,
+            table=self._db_config.table,
+            columns=self._columns,
+            json_rows=backup_rows,
+            label=label,
+            logger=self.logger,
+        )
+        if not restored:
+            self.logger.warning(f"恢复 Stream Load 失败，降级 MySQL INSERT: task={task_str}")
+            restored = self._batch_insert_rows(backup_rows)
+        if restored and self._count_records(date_str, node_id) == len(backup_rows):
+            self.logger.warning(f"恢复旧数据成功: task={task_str}, rows={len(backup_rows)}")
+            return True
+        self.logger.error(f"恢复旧数据失败或行数不一致: task={task_str}")
+        return False
 
     @retry(
         exceptions=DATABASE_EXCEPTIONS,
@@ -506,6 +620,7 @@ class CategoryBSRWorkflow:
 
                 if not needs_backfill and not force:
                     self.logger.info(f"任务无需处理，跳过: task={task_str}")
+                    self._record_task_status(task_str, skipped_existing=True)
                     log_sync_event("fill_missing", "SKIP", task_str, "无需回填")
                     return True
 
@@ -534,7 +649,23 @@ class CategoryBSRWorkflow:
                     continue
                 break
 
-            # Step 3: 删除旧数据（幂等性保证）
+            # Step 3: 备份并删除旧数据（避免刷新失败后留下空数据）
+            try:
+                backup_rows, backup_path = self._backup_existing_rows(date_str, node_id)
+            except Exception as e:
+                self.logger.error(f"备份旧数据失败，禁止删除旧数据: task={task_str}, error={e}")
+                self._record_task_status(task_str, backup_status="failed", backup_error=str(e))
+                log_sync_event("fill_missing", "FAIL", task_str, "备份旧数据失败")
+                if attempt < self.MAX_RETRY:
+                    self.logger.info(f"准备重试: task={task_str}, next_attempt={attempt + 2}")
+                    continue
+                break
+            self._record_task_status(
+                task_str,
+                backup_status="ok" if backup_rows else "empty",
+                backup_path=str(backup_path) if backup_path else None,
+                backup_rows=len(backup_rows),
+            )
             self.logger.info(f"清理旧数据（幂等性保证）: task={task_str}, attempt={attempt + 1}")
             if not self._delete_old_data(date_str, node_id):
                 log_sync_event("fill_missing", "FAIL", task_str, "删除旧数据失败")
@@ -567,6 +698,8 @@ class CategoryBSRWorkflow:
                 self.logger.warning(f"Stream Load 失败，降级使用 MySQL 批量 INSERT: task={task_str}")
                 if not self._batch_insert_rows(json_rows):
                     log_sync_event("fill_missing", "FAIL", task_str, "Stream Load/MySQL INSERT 均失败")
+                    restore_ok = self._restore_backup_rows(date_str, node_id, backup_rows, backup_path)
+                    self._record_task_status(task_str, restore_status="ok" if restore_ok else "failed")
                     if attempt < self.MAX_RETRY:
                         self.logger.info(f"准备重试: task={task_str}, next_attempt={attempt + 2}")
                         continue
@@ -577,9 +710,10 @@ class CategoryBSRWorkflow:
                 log_sync_event("fill_missing", "SUCCESS", task_str, "")
                 return True
 
-            # 验证失败，回滚
-            self.logger.warning(f"验证失败，回滚: task={task_str}, attempt={attempt + 1}")
-            self._delete_old_data(date_str, node_id)
+            # 验证失败，恢复旧数据
+            self.logger.warning(f"验证失败，恢复旧数据: task={task_str}, attempt={attempt + 1}")
+            restore_ok = self._restore_backup_rows(date_str, node_id, backup_rows, backup_path)
+            self._record_task_status(task_str, restore_status="ok" if restore_ok else "failed")
 
             # 如果还有重试次数，再试一次
             if attempt < self.MAX_RETRY:
@@ -684,6 +818,10 @@ class CategoryBSRWorkflow:
                     failed.append(f"{task[0]}+{task[1]}")
 
         self.logger.info(f"处理完成: 成功={success}, 失败={len(failed)}, 总任务={len(tasks)}")
+        print(json.dumps({
+            "summary_type": "bsr_sync",
+            **self._task_status_summary(),
+        }, ensure_ascii=False, default=str))
         if failed:
             self.logger.error(f"失败的任务: {failed}")
             sys.exit(1)

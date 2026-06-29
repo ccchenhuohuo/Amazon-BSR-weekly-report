@@ -5,13 +5,13 @@ Sorftime BSR 缺失日期一键补全脚本（仅管道模式）
 功能:
     1. 支持单类目或多类目同步
     2. 自动检测 Doris 中缺失的目标星期数据（count != 100 或完全缺失）
-    3. 对指定日期执行：DELETE -> fetch -> transform -> stream_load -> verify
-    4. 保证幂等性：每次写入前先清理目标日期数据（默认行为）
+    3. 对指定日期执行：fetch -> transform -> backup -> DELETE -> stream_load -> verify
+    4. 保证幂等性：完整 Top100 默认跳过；显式 --force 才刷新并启用备份恢复
     5. 支持并发模式
     6. 支持灵活的星期配置
 
 用法:
-    # 同步所有类目（默认周五）
+    # 同步所有类目（默认周三）
     python3 fill_missing.py
 
     # 指定星期几同步（支持 0-6, 周一/mon, 周五/fri 等）
@@ -74,7 +74,7 @@ def main():
     )
     parser.add_argument(
         "--weekday", "-w",
-        help=f"指定目标星期（0-6, 周一/mon-周日/sun，默认周五）"
+        help=f"指定目标星期（0-6, 周一/mon-周日/sun，默认周三）"
     )
     parser.add_argument(
         "--check-only", action="store_true",

@@ -16,55 +16,39 @@ import time
 from pathlib import Path
 from typing import Any
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
-REQUIRED_TABLES = [
-    "异动数据",
-    "低分高销数据",
-    "本品数据",
-    "2.1.1",
-    "2.2",
-    "2.3",
-    "2.4",
-    "2.5.2",
-    "3.1.1",
-    "3.2",
-    "3.3",
-    "3.4",
-    "3.5.2",
-    "4.1.1",
-    "4.1.2",
-]
-
-CATEGORY_MAP = {
-    "灯光类": ("Continuous Output Lighting", "Selfie Lights"),
-    "支架类": ("Cradles", "Grips"),
-    "脚架类": ("Complete Tripods", "Tripods"),
-}
-
-MOVEMENT_SECTIONS = {
-    "2.1.1": ("TOP10产品", 0),
-    "2.2": ("强势上升产品", 0),
-    "2.3": ("强势下降产品", 0),
-    "2.4": ("新上榜产品", 0),
-    "3.1.1": ("TOP10产品", 1),
-    "3.2": ("强势上升产品", 1),
-    "3.3": ("强势下降产品", 1),
-    "3.4": ("新上榜产品", 1),
-}
-
-LOW_SALES_SECTIONS = {
-    "2.5.2": 0,
-    "3.5.2": 1,
-}
-
-OWN_SECTIONS = {
-    "4.1.1": 0,
-    "4.1.2": 1,
-}
+from report_parser import (
+    CATEGORY_MAP,
+    LOW_SALES_SECTIONS,
+    MOVEMENT_SECTIONS,
+    OWN_SECTIONS,
+    OWN_TABLES,
+    REQUIRED_TABLES,
+    SyncError,
+    asin_link,
+    asin_plain,
+    build_records,
+    cell_text,
+    common_product_fields,
+    image_url,
+    infer_report_category,
+    low_sales_record,
+    movement_record,
+    normalize_row,
+    number_value,
+    own_record,
+    parse_tables,
+    previous_week,
+    record_fields,
+    split_md_row,
+    validate_records,
+)
 
 ATTACHMENT_FIELDS = {"附件", "附图"}
 DEFAULT_TEMPLATE_BASE_TOKEN = os.environ.get("FEISHU_TEMPLATE_BASE_TOKEN", "")
-OWN_TABLES = {"本品数据", "4.1.1", "4.1.2"}
 LARK_CLI_BIN = os.environ.get("LARK_CLI_BIN", "lark-cli")
 LARK_CLI_TIMEOUT_SECONDS = int(os.environ.get("LARK_CLI_TIMEOUT_SECONDS", "240"))
 BASE_VERIFY_MAX_ATTEMPTS = int(os.environ.get("BASE_VERIFY_MAX_ATTEMPTS", "6"))
@@ -87,10 +71,6 @@ STATIC_FOLDER_TABLES = {
     "低分高销": ("2.5.2", "3.5.2"),
     "本品": ("4.1.1", "4.1.2"),
 }
-
-
-class SyncError(RuntimeError):
-    pass
 
 
 def redact_cli_args(args: list[str]) -> list[str]:
@@ -234,270 +214,6 @@ def run_cli(args: list[str], *, dry_run: bool = False, allow_failure: bool = Fal
     if data.get("ok") is False:
         raise SyncError(f"CLI returned ok=false for {safe_cmd}:\n{redact_text_for_log(proc.stdout)}")
     return data
-
-
-def split_md_row(line: str) -> list[str]:
-    line = line.strip()
-    if line.startswith("|"):
-        line = line[1:]
-    if line.endswith("|"):
-        line = line[:-1]
-    cells: list[str] = []
-    buf: list[str] = []
-    escaped = False
-    for ch in line:
-        if escaped:
-            if ch == "|":
-                buf.append("|")
-            else:
-                buf.append("\\")
-                buf.append(ch)
-            escaped = False
-            continue
-        if ch == "\\":
-            escaped = True
-            continue
-        if ch == "|":
-            cells.append("".join(buf).strip())
-            buf = []
-        else:
-            buf.append(ch)
-    if escaped:
-        buf.append("\\")
-    cells.append("".join(buf).strip())
-    return cells
-
-
-def is_separator(line: str) -> bool:
-    cells = split_md_row(line)
-    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", c.strip()) for c in cells)
-
-
-def parse_tables(report_path: Path) -> dict[str, list[dict[str, str]]]:
-    lines = report_path.read_text(encoding="utf-8").splitlines()
-    current_section: str | None = None
-    wanted = set(MOVEMENT_SECTIONS) | set(LOW_SALES_SECTIONS) | set(OWN_SECTIONS)
-    tables: dict[str, list[dict[str, str]]] = {}
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        heading = re.match(r"^#{2,6}\s+(\d+(?:\.\d+)+)\b", line)
-        if heading:
-            section = heading.group(1)
-            current_section = section if section in wanted else None
-        if (
-            current_section
-            and current_section not in tables
-            and line.lstrip().startswith("|")
-            and i + 1 < len(lines)
-            and is_separator(lines[i + 1])
-        ):
-            headers = split_md_row(line)
-            rows: list[dict[str, str]] = []
-            i += 2
-            while i < len(lines) and lines[i].lstrip().startswith("|"):
-                cells = split_md_row(lines[i])
-                if len(cells) < len(headers):
-                    cells += [""] * (len(headers) - len(cells))
-                row = dict(zip(headers, cells[: len(headers)]))
-                if any(v.strip() for v in row.values()):
-                    rows.append(row)
-                i += 1
-            tables[current_section] = rows
-            continue
-        i += 1
-    return tables
-
-
-def clean_key(key: str) -> str:
-    return key.strip().replace("($)", "").replace("(件)", "")
-
-
-def normalize_row(row: dict[str, str]) -> dict[str, str]:
-    return {clean_key(k): v.strip() for k, v in row.items()}
-
-
-def number_value(value: str | None) -> int | float | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if text in {"", "-", "—", "None", "none", "null"}:
-        return None
-    text = text.replace("$", "").replace(",", "").replace("+", "").strip()
-    if not text:
-        return None
-    try:
-        num = float(text)
-    except ValueError:
-        return None
-    return int(num) if num.is_integer() else num
-
-
-def asin_link(value: str | None) -> str | None:
-    if not value:
-        return None
-    text = value.strip()
-    match = re.search(r"\[([A-Z0-9]{10})\]\((https://www\.amazon\.com/dp/[A-Z0-9]{10})\)", text)
-    if match:
-        return f"[{match.group(1)}]({match.group(2)})"
-    match = re.search(r"\b([A-Z0-9]{10})\b", text)
-    if match:
-        asin = match.group(1)
-        return f"[{asin}](https://www.amazon.com/dp/{asin})"
-    return None
-
-
-def asin_plain(value: str | None) -> str | None:
-    link = asin_link(value)
-    if not link:
-        return None
-    match = re.search(r"\[([A-Z0-9]{10})\]", link)
-    return match.group(1) if match else None
-
-
-def image_url(value: str | None) -> str | None:
-    if not value:
-        return None
-    match = re.search(r'src="([^"]+)"', value)
-    url = match.group(1) if match else value.strip()
-    return url if url.startswith("https://") else None
-
-
-def common_product_fields(row: dict[str, str], report_date: str, category: str) -> dict[str, Any] | None:
-    norm = normalize_row(row)
-    asin = asin_link(norm.get("ASIN"))
-    img = image_url(norm.get("商品图片"))
-    if not asin or not img:
-        return None
-    record: dict[str, Any] = {
-        "报告日期": f"{report_date} 00:00:00",
-        "类目": category,
-        "品牌": norm.get("品牌"),
-        "产品名称": norm.get("产品名称"),
-        "ASIN": asin,
-        "价格": number_value(norm.get("价格")),
-        "评分": number_value(norm.get("评分")),
-        "月销": number_value(norm.get("月销")),
-        "上架天数": number_value(norm.get("上架天数")),
-        "商品图片": img,
-    }
-    return record
-
-
-def movement_record(
-    section: str, row: dict[str, str], report_date: str, categories: tuple[str, str]
-) -> dict[str, Any] | None:
-    data_type, category_idx = MOVEMENT_SECTIONS[section]
-    base = common_product_fields(row, report_date, categories[category_idx])
-    if not base:
-        return None
-    norm = normalize_row(row)
-    base["数据类型"] = data_type
-    if data_type == "TOP10产品":
-        base["排名"] = number_value(norm.get("排名"))
-        base["上周排名"] = number_value(norm.get("上周排名"))
-        base["排名变化"] = number_value(norm.get("排名变化"))
-        base["是否新品"] = None
-    elif data_type in {"强势上升产品", "强势下降产品"}:
-        base["排名"] = number_value(norm.get("本周排名"))
-        base["上周排名"] = number_value(norm.get("上周排名"))
-        base["排名变化"] = number_value(norm.get("排名变化"))
-        base["是否新品"] = None
-    else:
-        base["排名"] = number_value(norm.get("本周排名"))
-        base["上周排名"] = None
-        base["排名变化"] = None
-        base["是否新品"] = norm.get("是否新品") or None
-    return base
-
-
-def low_sales_record(
-    section: str, row: dict[str, str], report_date: str, categories: tuple[str, str]
-) -> dict[str, Any] | None:
-    category = categories[LOW_SALES_SECTIONS[section]]
-    base = common_product_fields(row, report_date, category)
-    if not base:
-        return None
-    norm = normalize_row(row)
-    base["排名"] = number_value(norm.get("排名"))
-    base["上周排名"] = number_value(norm.get("上周排名"))
-    base["排名变化"] = number_value(norm.get("排名变化"))
-    return base
-
-
-def own_record(
-    section: str,
-    row: dict[str, str],
-    report_date: str,
-    previous_date: str,
-    categories: tuple[str, str],
-) -> dict[str, Any] | None:
-    norm = normalize_row(row)
-    asin = asin_link(norm.get("ASIN"))
-    img = image_url(norm.get("商品图片"))
-    if not asin or not img:
-        return None
-    return {
-        "报告日期": f"{report_date} 00:00:00",
-        "类目": categories[OWN_SECTIONS[section]],
-        "产品名称": norm.get("产品名称"),
-        "ASIN": asin,
-        f"{previous_date}排名": number_value(norm.get(f"{previous_date}排名")),
-        f"{report_date}排名": number_value(norm.get(f"{report_date}排名")),
-        "排名变化": number_value(norm.get("排名变化")),
-        "价格": number_value(norm.get("价格")),
-        "评分": number_value(norm.get("评分")),
-        "月销": number_value(norm.get("月销")),
-        "上架天数": number_value(norm.get("上架天数")),
-        "商品图片": img,
-    }
-
-
-def infer_report_category(report_path: Path, explicit: str | None) -> str:
-    if explicit:
-        return explicit
-    for category in CATEGORY_MAP:
-        if category in report_path.name:
-            return category
-    raise SyncError(f"Cannot infer report category from path: {report_path}")
-
-
-def previous_week(report_date: str) -> str:
-    return (dt.date.fromisoformat(report_date) - dt.timedelta(days=7)).isoformat()
-
-
-def build_records(
-    report_path: Path, report_category: str, report_date: str, previous_date: str
-) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
-    categories = CATEGORY_MAP[report_category]
-    tables = parse_tables(report_path)
-    missing = [s for s in (set(MOVEMENT_SECTIONS) | set(LOW_SALES_SECTIONS) | set(OWN_SECTIONS)) if s not in tables]
-    if missing:
-        raise SyncError(f"Missing target Markdown tables: {', '.join(sorted(missing))}")
-
-    mother = {"异动数据": [], "低分高销数据": [], "本品数据": []}
-    child: dict[str, list[dict[str, Any]]] = {section: [] for section in REQUIRED_TABLES if re.match(r"^[234]\.", section)}
-
-    for section in MOVEMENT_SECTIONS:
-        rows = [r for r in (movement_record(section, row, report_date, categories) for row in tables[section]) if r]
-        mother["异动数据"].extend(rows)
-        child[section] = rows
-
-    for section in LOW_SALES_SECTIONS:
-        rows = [r for r in (low_sales_record(section, row, report_date, categories) for row in tables[section]) if r]
-        mother["低分高销数据"].extend(rows)
-        child[section] = rows
-
-    for section in OWN_SECTIONS:
-        rows = [
-            r
-            for r in (own_record(section, row, report_date, previous_date, categories) for row in tables[section])
-            if r
-        ]
-        mother["本品数据"].extend(rows)
-        child[section] = rows
-
-    return mother, child
 
 
 def table_map(base_token: str) -> dict[str, str]:
@@ -920,6 +636,7 @@ def write_records(
         payload = {"fields": ordered_fields, "rows": rows}
         payload_path = log_dir / f"payload-{table_name}-{start // 200 + 1}.json"
         payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.chmod(payload_path, 0o600)
         run_cli(
             [
                 "base",
@@ -975,6 +692,133 @@ def clear_table(base_token: str, table_id: str, dry_run: bool) -> int:
         args.append("--yes")
         run_cli(args)
     return len(record_ids)
+
+
+def snapshot_table_records(
+    base_token: str,
+    table_name: str,
+    table_id: str,
+    snapshot_dir: Path,
+    dry_run: bool,
+) -> dict[str, Any]:
+    if dry_run:
+        return {"table": table_name, "count": 0, "path": None, "status": "dry_run"}
+    records = list_records(base_token, table_id)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(snapshot_dir, 0o700)
+    snapshot_path = snapshot_dir / f"{table_name}.json"
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "table": table_name,
+                "table_id": table_id,
+                "record_count": len(records),
+                "records": records,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(snapshot_path, 0o600)
+    return {"table": table_name, "count": len(records), "path": display_path(snapshot_path), "status": "ok"}
+
+
+def restore_snapshot_records(
+    base_token: str,
+    table_name: str,
+    table_id: str,
+    snapshot: dict[str, Any],
+    dry_run: bool,
+    log_dir: Path,
+) -> dict[str, Any]:
+    if dry_run:
+        return {"table": table_name, "status": "dry_run", "restored": 0}
+    snapshot_path = snapshot.get("path")
+    if not snapshot_path:
+        return {"table": table_name, "status": "skipped_empty_snapshot", "restored": 0}
+    raw_path = Path(str(snapshot_path).replace("$PWD", str(Path.cwd())))
+    try:
+        data = json.loads(raw_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"table": table_name, "status": "failed", "reason": str(exc), "restored": 0}
+    records = data.get("records") if isinstance(data, dict) else None
+    if not isinstance(records, list) or not records:
+        clear_table(base_token, table_id, dry_run=False)
+        return {"table": table_name, "status": "ok", "restored": 0}
+
+    field_order = collections.OrderedDict()
+    row_fields: list[dict[str, Any]] = []
+    for record in records:
+        fields = record_fields(record) if isinstance(record, dict) else {}
+        row_fields.append(fields)
+        for field_name in fields:
+            field_order[field_name] = None
+    fields = list(field_order)
+    if not fields:
+        return {"table": table_name, "status": "failed", "reason": "snapshot records have no fields", "restored": 0}
+
+    clear_table(base_token, table_id, dry_run=False)
+    for start in range(0, len(row_fields), 200):
+        chunk = row_fields[start : start + 200]
+        payload = {"fields": fields, "rows": [[row.get(field) for field in fields] for row in chunk]}
+        payload_path = log_dir / f"restore-{table_name}-{start // 200 + 1}.json"
+        payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.chmod(payload_path, 0o600)
+        run_cli(
+            [
+                "base",
+                "+record-batch-create",
+                "--base-token",
+                base_token,
+                "--table-id",
+                table_id,
+                "--json",
+                f"@{payload_path}",
+            ],
+        )
+    actual_count = len(list_records(base_token, table_id))
+    if actual_count != len(row_fields):
+        return {
+            "table": table_name,
+            "status": "failed",
+            "reason": "restore readback count mismatch",
+            "expected": len(row_fields),
+            "actual": actual_count,
+            "restored": len(row_fields),
+        }
+    return {"table": table_name, "status": "ok", "restored": len(row_fields), "actual": actual_count}
+
+
+def restore_overwrite_snapshots(
+    base_token: str,
+    tables: dict[str, str],
+    snapshots: dict[str, dict[str, Any]],
+    dry_run: bool,
+    log_dir: Path,
+) -> dict[str, Any]:
+    restored: dict[str, Any] = {}
+    failures: dict[str, Any] = {}
+    for table_name, snapshot in snapshots.items():
+        try:
+            result = restore_snapshot_records(
+                base_token,
+                table_name,
+                tables[table_name],
+                snapshot,
+                dry_run,
+                log_dir,
+            )
+        except Exception as exc:
+            result = {"table": table_name, "status": "failed", "reason": str(exc), "restored": 0}
+        restored[table_name] = result
+        if result.get("status") not in {"ok", "dry_run", "skipped_empty_snapshot"}:
+            failures[table_name] = result
+    return {
+        "status": "failed" if failures else "ok",
+        "restored_tables": restored,
+        "restore_failures": failures,
+    }
 
 
 def list_views(base_token: str, table_id: str) -> list[dict[str, Any]]:
@@ -1134,69 +978,6 @@ def ensure_template_view_layout(
             set_view_visible_fields(base_token, table_id, view_id, expected, dry_run)
             changed.setdefault(table_name, []).append(view_name)
     return changed
-
-
-def validate_records(
-    mother: dict[str, list[dict[str, Any]]],
-    child: dict[str, list[dict[str, Any]]],
-) -> dict[str, Any]:
-    issues: list[str] = []
-    counts = {**{k: len(v) for k, v in mother.items()}, **{k: len(v) for k, v in child.items()}}
-    for table_name, records in {**mother, **child}.items():
-        for idx, record in enumerate(records, start=1):
-            img = record.get("商品图片")
-            asin = record.get("ASIN")
-            if img and (not str(img).startswith("https://") or "<img" in str(img)):
-                issues.append(f"{table_name} row {idx}: invalid image {img}")
-            if asin and not re.fullmatch(r"\[[A-Z0-9]{10}\]\(https://www\.amazon\.com/dp/[A-Z0-9]{10}\)", str(asin)):
-                issues.append(f"{table_name} row {idx}: invalid ASIN link {asin}")
-            if record.get("数据类型") == "新上榜产品":
-                if record.get("上周排名") is not None or record.get("排名变化") is not None:
-                    issues.append(f"{table_name} row {idx}: new listing has previous/rank change value")
-            elif "数据类型" in record and record.get("是否新品") is not None:
-                issues.append(f"{table_name} row {idx}: non-new-listing has 是否新品")
-
-    duplicate_specs = {
-        "异动数据": ["ASIN", "类目", "数据类型"],
-        "低分高销数据": ["ASIN", "类目"],
-        "本品数据": ["ASIN", "类目"],
-    }
-    duplicates: dict[str, list[tuple[Any, ...]]] = {}
-    for table_name, keys in duplicate_specs.items():
-        seen: set[tuple[Any, ...]] = set()
-        dup: list[tuple[Any, ...]] = []
-        for record in mother[table_name]:
-            key = tuple(record.get(k) for k in keys)
-            if key in seen:
-                dup.append(key)
-            seen.add(key)
-        if dup:
-            duplicates[table_name] = dup
-    return {"counts": counts, "issues": issues, "duplicates": duplicates}
-
-
-def cell_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, list):
-        return "".join(cell_text(item) for item in value)
-    if isinstance(value, dict):
-        for key in ("text", "link", "url", "value", "name"):
-            if key in value:
-                return cell_text(value[key])
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return str(value)
-
-
-def record_fields(record: dict[str, Any]) -> dict[str, Any]:
-    fields = record.get("fields")
-    if isinstance(fields, dict):
-        return fields
-    return {key: value for key, value in record.items() if key not in {"id", "record_id", "recordId"}}
 
 
 def list_records(base_token: str, table_id: str) -> list[dict[str, Any]]:
@@ -1379,6 +1160,7 @@ def main() -> int:
     run_id = f"{report_date}-{report_category}-{int(time.time())}"
     log_dir = args.log_dir / run_id
     log_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(log_dir, 0o700)
 
     log_progress(f"start category={report_category} date={report_date} dry_run={args.dry_run}")
     if args.prepare_only:
@@ -1394,6 +1176,7 @@ def main() -> int:
 
     summary_path = log_dir / "parsed-summary.json"
     summary_path.write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.chmod(summary_path, 0o600)
 
     log_progress("reading target Base tables and fields")
     tables = table_map(args.base_token)
@@ -1444,30 +1227,142 @@ def main() -> int:
         args.dry_run,
     )
 
-    if args.overwrite and not args.prepare_only:
-        log_progress("clearing existing records")
-        deleted = {}
-        for table_name in REQUIRED_TABLES:
-            deleted[table_name] = clear_table(args.base_token, tables[table_name], args.dry_run)
-        (log_dir / "deleted-counts.json").write_text(json.dumps(deleted, ensure_ascii=False, indent=2), encoding="utf-8")
+    overwrite_recovery: dict[str, Any] = {
+        "status": "not_applicable",
+        "snapshots": {},
+        "cleared_tables": {},
+        "written_tables": [],
+        "failed_tables": [],
+        "snapshot_failures": {},
+        "clear_failures": {},
+        "write_failures": [],
+        "restored_tables": {},
+        "restore_failures": {},
+    }
+    write_error: str | None = None
+    server_verification: dict[str, Any]
+    current_write_table: str | None = None
 
-    if not args.prepare_only:
-        log_progress("writing mother tables")
-        for table_name, records in mother.items():
-            write_records(args.base_token, table_name, tables[table_name], all_fields[table_name], records, args.dry_run, log_dir)
-        log_progress("writing child tables")
-        for table_name, records in child.items():
-            write_records(args.base_token, table_name, tables[table_name], all_fields[table_name], records, args.dry_run, log_dir)
+    try:
+        if args.overwrite and not args.prepare_only:
+            log_progress("snapshotting existing records")
+            snapshot_dir = log_dir / "snapshots"
+            for table_name in REQUIRED_TABLES:
+                try:
+                    overwrite_recovery["snapshots"][table_name] = snapshot_table_records(
+                        args.base_token,
+                        table_name,
+                        tables[table_name],
+                        snapshot_dir,
+                        args.dry_run,
+                    )
+                except Exception as exc:
+                    overwrite_recovery["snapshot_failures"][table_name] = str(exc)
+                    raise
+            overwrite_recovery["status"] = "snapshotted"
 
-    log_progress("verifying records from Base")
-    server_verification = verify_written_records(
-        args.base_token,
-        tables,
-        validation["counts"],
-        dry_run=args.dry_run,
-        prepare_only=args.prepare_only,
-        overwrite=args.overwrite,
-    )
+            log_progress("clearing existing records")
+            for table_name in REQUIRED_TABLES:
+                try:
+                    overwrite_recovery["cleared_tables"][table_name] = clear_table(
+                        args.base_token,
+                        tables[table_name],
+                        args.dry_run,
+                    )
+                except Exception as exc:
+                    overwrite_recovery["clear_failures"][table_name] = str(exc)
+                    raise
+            overwrite_recovery.update(
+                {
+                    "status": "cleared",
+                }
+            )
+            (log_dir / "deleted-counts.json").write_text(
+                json.dumps(overwrite_recovery["cleared_tables"], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.chmod(log_dir / "deleted-counts.json", 0o600)
+
+        if not args.prepare_only:
+            log_progress("writing mother tables")
+            for table_name, records in mother.items():
+                current_write_table = table_name
+                write_records(
+                    args.base_token,
+                    table_name,
+                    tables[table_name],
+                    all_fields[table_name],
+                    records,
+                    args.dry_run,
+                    log_dir,
+                )
+                overwrite_recovery["written_tables"].append(table_name)
+            log_progress("writing child tables")
+            for table_name, records in child.items():
+                current_write_table = table_name
+                write_records(
+                    args.base_token,
+                    table_name,
+                    tables[table_name],
+                    all_fields[table_name],
+                    records,
+                    args.dry_run,
+                    log_dir,
+                )
+                overwrite_recovery["written_tables"].append(table_name)
+            current_write_table = None
+
+        log_progress("verifying records from Base")
+        server_verification = verify_written_records(
+            args.base_token,
+            tables,
+            validation["counts"],
+            dry_run=args.dry_run,
+            prepare_only=args.prepare_only,
+            overwrite=args.overwrite,
+        )
+        if (
+            args.overwrite
+            and not args.prepare_only
+            and not args.dry_run
+            and server_verification.get("status") == "failed"
+        ):
+            overwrite_recovery["failed_tables"] = [
+                issue.split(":", 1)[0]
+                for issue in server_verification.get("issues", [])
+                if isinstance(issue, str) and ":" in issue
+            ]
+            recovery = restore_overwrite_snapshots(
+                args.base_token,
+                tables,
+                overwrite_recovery["snapshots"],
+                args.dry_run,
+                log_dir,
+            )
+            overwrite_recovery.update(recovery)
+    except Exception as exc:
+        write_error = str(exc)
+        if current_write_table:
+            overwrite_recovery["failed_tables"].append(current_write_table)
+            overwrite_recovery["write_failures"].append(
+                {"table": current_write_table, "error": write_error}
+            )
+        server_verification = {
+            "status": "failed",
+            "expected_counts": validation["counts"],
+            "actual_counts": {},
+            "issues": [f"write failed: {write_error}"],
+            "duplicates": {},
+        }
+        if args.overwrite and not args.prepare_only:
+            recovery = restore_overwrite_snapshots(
+                args.base_token,
+                tables,
+                overwrite_recovery["snapshots"],
+                args.dry_run,
+                log_dir,
+            )
+            overwrite_recovery.update(recovery)
 
     result = {
         "report": display_path(args.report) if args.report else None,
@@ -1487,9 +1382,12 @@ def main() -> int:
             "template_views": {table_name: [view["name"] for view in views] for table_name, views in template_views.items()},
         },
         "server_verification": server_verification,
+        "overwrite_recovery": overwrite_recovery,
         "log_dir": display_path(log_dir),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if write_error or overwrite_recovery.get("restore_failures"):
+        return 1
     if has_blocking_result(folder_rename, server_verification):
         return 1
     return 0

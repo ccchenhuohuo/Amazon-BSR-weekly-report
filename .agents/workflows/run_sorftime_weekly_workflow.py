@@ -13,74 +13,45 @@ import hashlib
 import json
 import os
 import re
-import shlex
-import subprocess
+import shutil
 import sys
-import threading
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+WORKFLOW_DIR = Path(__file__).resolve().parent
+if str(WORKFLOW_DIR) not in sys.path:
+    sys.path.insert(0, str(WORKFLOW_DIR))
+
+import command_runner as command_runner_module
+from command_runner import (
+    SECRET_FLAGS,
+    SECRET_KEY_PARTS,
+    SECRET_OUTPUT_KEYS,
+    StepResult,
+    command_text,
+    extract_json_object,
+    find_nested_value,
+    iter_dicts,
+    redact_command,
+    redact_detail,
+    redact_local_paths,
+    redact_output_text,
+    report_date_text,
+    run_command,
+)
+from publication_registry import PublicationRegistry, PublicationRegistryError
+
 DEFAULT_REPORT_DIR = PROJECT_ROOT / "reports"
+DEFAULT_PUBLICATION_STATE = PROJECT_ROOT / "state" / "publications.json"
 CATEGORIES = ("灯光类", "支架类", "脚架类")
 DEFAULT_FEISHU_WEB_ORIGIN = "https://ulanzichina.feishu.cn"
-SECRET_FLAGS = {
-    "--base-token",
-    "--template-base-token",
-    "--folder-token",
-    "--doc",
-    "--chat-id",
-    "--user-id",
-    "--content",
-    "--markdown",
-    "--text",
-}
-SECRET_KEY_PARTS = ("token", "password", "secret", "api_key", "url")
-SECRET_OUTPUT_KEYS = (
-    "app_token",
-    "base_token",
-    "template_base_token",
-    "folder_token",
-    "docx_token",
-    "doc_token",
-    "document_id",
-    "block_token",
-    "token",
-    "url",
-    "chat_id",
-    "open_chat_id",
-    "open_id",
-    "user_id",
-    "user_open_id",
-    "userOpenId",
-    "openId",
-    "message_id",
-    "receive_id",
-)
 LARK_CLI_BIN = "lark-cli"
 FRONT_MATTER_PATTERN = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.DOTALL)
 IMAGE_TAG_PATTERN = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 IMAGE_PLACEHOLDER = "图片见 Base 数据表"
-
-
-@dataclass
-class StepResult:
-    name: str
-    status: str
-    command: list[str] | None = None
-    returncode: int | None = None
-    stdout: str = ""
-    stderr: str = ""
-    detail: dict | None = None
-    streamed: bool = False
-
-
-def redact_local_paths(text: str) -> str:
-    redacted = text.replace(str(PROJECT_ROOT), "$PROJECT_ROOT")
-    return re.sub(r"/Users/[^\s\"'`]+", "[LOCAL_PATH]", redacted)
 
 
 def most_recent_finished_wednesday(now: datetime | None = None) -> date:
@@ -132,156 +103,156 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return default
+
+
+def required_runtime_paths() -> list[Path]:
+    return [
+        Path(".agents/workflows/command_runner.py"),
+        Path(".agents/workflows/publication_registry.py"),
+        Path(".agents/skills/sorftime-bsr-sync/scripts/sorftime_api/category/CategoryRequest/fill_missing.py"),
+        Path(".agents/skills/sorftime-weekly-report/scripts/generate_weekly_report.py"),
+        Path(".agents/skills/sorftime-weekly-report/scripts/validate_report.py"),
+        Path(".agents/skills/sorftime-report-base-sync/scripts/sync_report_to_base.py"),
+        Path(".agents/skills/sorftime-report-base-sync/scripts/report_parser.py"),
+    ]
+
+
+def dependency_import_status() -> dict[str, bool]:
+    modules = ("requests", "pymysql", "dotenv")
+    status: dict[str, bool] = {}
+    for module_name in modules:
+        try:
+            __import__(module_name)
+        except ImportError:
+            status[module_name] = False
+        else:
+            status[module_name] = True
+    return status
+
+
+def lark_cli_status() -> dict[str, object]:
+    cli = LARK_CLI_BIN
+    if Path(cli).is_absolute():
+        resolved = Path(cli)
+    else:
+        found = shutil.which(cli)
+        resolved = Path(found) if found else Path(cli)
+    return {
+        "configured": cli,
+        "resolved": str(resolved),
+        "absolute": Path(cli).is_absolute(),
+        "exists": resolved.exists(),
+        "executable": os.access(resolved, os.X_OK) if resolved.exists() else False,
+    }
+
+
+def run_preflight_checks(args: argparse.Namespace) -> list[StepResult]:
+    results: list[StepResult] = []
+
+    missing_paths = [str(path) for path in required_runtime_paths() if not (PROJECT_ROOT / path).exists()]
+    results.append(
+        StepResult(
+            "preflight:runtime-files",
+            "failed" if missing_paths else "ok",
+            detail={"missing": missing_paths},
+        )
+    )
+
+    dependency_status = dependency_import_status()
+    missing_dependencies = [name for name, present in dependency_status.items() if not present]
+    results.append(
+        StepResult(
+            "preflight:python-dependencies",
+            "failed" if missing_dependencies else "ok",
+            detail={"imports": dependency_status, "missing": missing_dependencies},
+        )
+    )
+
+    cli_status = lark_cli_status()
+    results.append(
+        StepResult(
+            "preflight:lark-cli",
+            "ok" if cli_status["exists"] and cli_status["executable"] else "failed",
+            detail=cli_status,
+        )
+    )
+
+    notify_recipient_present = bool(args.notify_chat_id or args.notify_user_id)
+    results.append(
+        StepResult(
+            "preflight:notify-recipient",
+            "failed" if args.require_notify and not notify_recipient_present else "ok",
+            detail={
+                "required": args.require_notify,
+                "recipient_present": notify_recipient_present,
+                "recipient_type": "chat_id" if args.notify_chat_id else "user_id" if args.notify_user_id else "",
+            },
+        )
+    )
+
+    registry_path = args.publication_state or DEFAULT_PUBLICATION_STATE
+    registry_detail = {"registry": str(registry_path), "exists": registry_path.exists()}
+    try:
+        if registry_path.exists():
+            PublicationRegistry(registry_path).load()
+    except PublicationRegistryError as exc:
+        registry_detail["reason"] = str(exc)
+        registry_status = "failed"
+    else:
+        registry_status = "ok"
+    results.append(StepResult("preflight:publication-registry", registry_status, detail=registry_detail))
+
+    try:
+        base_tokens = load_base_token_json(args.base_token_json)
+        base_tokens.update(parse_base_tokens(args.base_token))
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        results.append(
+            StepResult(
+                "preflight:base-token-config",
+                "failed",
+                detail={"reason": str(exc)},
+            )
+        )
+    else:
+        missing_explicit_tokens = [category for category in CATEGORIES if category not in base_tokens]
+        can_prepare_bases = (
+            args.skip_base_sync
+            or args.template_base_token
+            or args.no_copy_bases
+            or not missing_explicit_tokens
+            or registry_path.exists()
+        )
+        results.append(
+            StepResult(
+                "preflight:base-token-config",
+                "ok" if can_prepare_bases else "failed",
+                detail={
+                    "skip_base_sync": args.skip_base_sync,
+                    "template_base_token_present": bool(args.template_base_token),
+                    "publication_registry_present": registry_path.exists(),
+                    "missing_explicit_categories": missing_explicit_tokens,
+                    "no_copy_bases": args.no_copy_bases,
+                },
+            )
+        )
+
+    report_preflight = run_command(
+        "preflight:weekly-report",
+        [sys.executable, ".agents/skills/sorftime-weekly-report/scripts/generate_weekly_report.py", "--preflight"],
+        timeout_seconds=min(args.command_timeout_seconds, 120),
+    )
+    results.append(report_preflight)
+    return results
+
+
 def report_path(report_date: date, category: str, report_dir: Path) -> Path:
     return report_dir / f"{report_date:%Y%m%d}{category}周趋势监测报告.md"
-
-
-def redact_command(command: list[str] | None) -> list[str] | None:
-    if command is None:
-        return None
-    redacted = list(command)
-    for idx, part in enumerate(redacted[:-1]):
-        if part in SECRET_FLAGS:
-            redacted[idx + 1] = "[REDACTED]"
-    return [redact_output_text(part) for part in redacted]
-
-
-def redact_output_text(text: str) -> str:
-    redacted = text
-    for flag in SECRET_FLAGS:
-        redacted = re.sub(rf"({re.escape(flag)}\s+)\S+", rf"\1[REDACTED]", redacted)
-    key_pattern = "|".join(re.escape(key) for key in SECRET_OUTPUT_KEYS)
-    redacted = re.sub(
-        rf'("?({key_pattern})"?\s*:\s*)"[^"]*"',
-        r'\1"[REDACTED]"',
-        redacted,
-        flags=re.IGNORECASE,
-    )
-    redacted = re.sub(
-        r"https?://[^\s\"']*(?:feishu\.cn|larksuite\.com|/base/)[^\s\"']*",
-        "[REDACTED_URL]",
-        redacted,
-        flags=re.IGNORECASE,
-    )
-    redacted = re.sub(r"\b(?:ou|oc|om|omt)_[A-Za-z0-9_-]{8,}\b", "[REDACTED_ID]", redacted)
-    return redact_local_paths(redacted)
-
-
-def redact_detail(value: object, key: str = "") -> object:
-    lowered = key.lower()
-    if isinstance(value, dict):
-        return {item_key: redact_detail(item_value, item_key) for item_key, item_value in value.items()}
-    if isinstance(value, list):
-        return [redact_detail(item) for item in value]
-    if isinstance(value, str):
-        if any(part in lowered for part in SECRET_KEY_PARTS):
-            return "[REDACTED]" if value else value
-        return redact_output_text(value)
-    return value
-
-
-def run_command(name: str, command: list[str], timeout_seconds: int) -> StepResult:
-    print(f"\n## {name}: running", flush=True)
-    print("$ " + " ".join(redact_command(command) or []), flush=True)
-    try:
-        proc = subprocess.Popen(
-            command,
-            cwd=PROJECT_ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=1,
-        )
-    except FileNotFoundError as exc:
-        message = f"command not found: {command[0]}"
-        print(message, file=sys.stderr, flush=True)
-        return StepResult(
-            name=name,
-            status="failed",
-            command=redact_command(command),
-            returncode=127,
-            stderr=f"{message}: {exc}",
-        )
-    stdout_chunks: list[str] = []
-    stderr_chunks: list[str] = []
-
-    def pump(stream, chunks: list[str], target) -> None:
-        assert stream is not None
-        for line in iter(stream.readline, ""):
-            chunks.append(line)
-            print(redact_output_text(line), end="", file=target, flush=True)
-        stream.close()
-
-    stdout_thread = threading.Thread(target=pump, args=(proc.stdout, stdout_chunks, sys.stdout), daemon=True)
-    stderr_thread = threading.Thread(target=pump, args=(proc.stderr, stderr_chunks, sys.stderr), daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
-    timed_out = False
-    try:
-        returncode = proc.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        proc.kill()
-        returncode = proc.wait()
-    stdout_thread.join()
-    stderr_thread.join()
-    stdout = "".join(stdout_chunks)
-    stderr = "".join(stderr_chunks)
-    if timed_out:
-        stderr += f"\nCommand timed out after {timeout_seconds} seconds."
-    status = "ok" if returncode == 0 else "failed"
-    print(f"\n## {name}: {status} (returncode={returncode})", flush=True)
-    return StepResult(
-        name=name,
-        status=status,
-        command=redact_command(command),
-        returncode=returncode,
-        stdout=stdout,
-        stderr=stderr,
-        streamed=True,
-    )
-
-
-def extract_json_object(text: str) -> dict:
-    end = text.rfind("}")
-    if end < 0:
-        return {}
-    for start in reversed([idx for idx, char in enumerate(text[: end + 1]) if char == "{"]):
-        try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict):
-            return data
-    return {}
-
-
-def find_nested_value(data: object, keys: set[str]) -> str | None:
-    if isinstance(data, dict):
-        for key in keys:
-            value = data.get(key)
-            if isinstance(value, str) and value:
-                return value
-        for value in data.values():
-            found = find_nested_value(value, keys)
-            if found:
-                return found
-    elif isinstance(data, list):
-        for item in data:
-            found = find_nested_value(item, keys)
-            if found:
-                return found
-    return None
-
-
-def iter_dicts(data: object):
-    if isinstance(data, dict):
-        yield data
-        for value in data.values():
-            yield from iter_dicts(value)
-    elif isinstance(data, list):
-        for item in data:
-            yield from iter_dicts(item)
 
 
 def parse_copied_base(data: dict, source_token: str) -> dict[str, str | None]:
@@ -360,6 +331,36 @@ def parse_base_doc_block(data: dict) -> dict[str, str | None]:
     }
 
 
+def parse_base_doc_blocks(data: dict) -> list[dict[str, str | None]]:
+    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    raw_blocks = payload.get("blocks") if isinstance(payload, dict) else None
+    if not isinstance(raw_blocks, list):
+        raw_blocks = [
+            item
+            for item in iter_dicts(data)
+            if item.get("type") == "docx" or item.get("docx_token") or item.get("document_id")
+        ]
+    parsed: list[dict[str, str | None]] = []
+    for block in raw_blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") not in {None, "docx"} and not (block.get("docx_token") or block.get("document_id")):
+            continue
+        parsed.append(parse_base_doc_block({"data": {"block": block}}))
+    return parsed
+
+
+def unique_doc_block_by_name(data: dict, name: str) -> tuple[dict[str, str | None] | None, bool]:
+    matches = [block for block in parse_base_doc_blocks(data) if block.get("name") == name]
+    if not matches:
+        return None, False
+    tokens = {block.get("docx_token") for block in matches if block.get("docx_token")}
+    block_ids = {block.get("block_id") for block in matches if block.get("block_id")}
+    if len(matches) > 1 and (len(tokens) != 1 or len(block_ids) > 1):
+        return None, True
+    return matches[0], False
+
+
 def lark_cli_content_argument(path: Path) -> str:
     try:
         relative_path = path.resolve().relative_to(PROJECT_ROOT.resolve())
@@ -375,8 +376,10 @@ def prepare_base_doc_markdown(report_file: Path, content_dir: Path) -> tuple[Pat
     if image_count:
         text = IMAGE_TAG_PATTERN.sub(IMAGE_PLACEHOLDER, text)
     content_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(content_dir, 0o700)
     output_path = content_dir / f"{report_file.stem}.base-doc.md"
     output_path.write_text(text, encoding="utf-8")
+    os.chmod(output_path, 0o600)
     return output_path, image_count
 
 
@@ -401,6 +404,7 @@ def parse_base_sync_result(result: StepResult) -> dict:
         "folder_rename": data.get("folder_rename"),
         "block_layout": data.get("block_layout"),
         "server_verification": data.get("server_verification"),
+        "overwrite_recovery": data.get("overwrite_recovery"),
         "base_sync_log_dir": data.get("log_dir"),
     }
 
@@ -490,6 +494,8 @@ def publish_report_doc_to_base(
     dry_run: bool,
     timeout_seconds: int,
     doc_content_dir: Path | None = None,
+    existing_docx_token: str | None = None,
+    existing_docx_url: str | None = None,
 ) -> list[StepResult]:
     name = report_doc_name(report_date, category)
     if not base_token:
@@ -501,47 +507,134 @@ def publish_report_doc_to_base(
             )
         ]
 
-    create_cmd = [
+    results: list[StepResult] = []
+    created_doc = {
+        "block_id": None,
+        "docx_token": existing_docx_token,
+        "url": existing_docx_url,
+        "name": name,
+    }
+    docx_token = existing_docx_token
+
+    find_cmd = [
         LARK_CLI_BIN,
         "base",
-        "+base-block-create",
+        "+base-block-list",
         "--base-token",
         base_token,
         "--type",
         "docx",
-        "--name",
-        name,
         "--as",
         "user",
     ]
     if dry_run:
-        create_cmd.append("--dry-run")
-
-    create_result = run_command(f"base-doc-create:{category}", create_cmd, timeout_seconds=timeout_seconds)
-    create_data = extract_json_object(create_result.stdout)
-    created_doc = parse_base_doc_block(create_data)
-    create_ok = create_data.get("ok") if create_data else None
-    if create_result.status == "ok" and not dry_run and create_ok is False:
-        create_result.status = "failed"
-        create_result.stderr = (create_result.stderr + "\nBase doc create returned ok=false.").strip()
-    create_result.detail = {
+        find_cmd.append("--dry-run")
+    find_result = run_command(f"base-doc-find:{category}", find_cmd, timeout_seconds=timeout_seconds)
+    find_data = extract_json_object(find_result.stdout)
+    found_doc, ambiguous = unique_doc_block_by_name(find_data, name)
+    find_ok = find_data.get("ok") if find_data else None
+    if find_result.status == "ok" and not dry_run and find_ok is not True:
+        find_result.status = "failed"
+        find_result.stderr = (
+            find_result.stderr + f"\nBase doc list did not return ok=true (ok={find_ok!r})."
+        ).strip()
+    if ambiguous:
+        find_result.status = "failed"
+        find_result.stderr = (
+            find_result.stderr + f"\nMultiple Base docx blocks match requested name: {name}."
+        ).strip()
+    found_docx_token = found_doc.get("docx_token") if found_doc else None
+    registered_docx_matched = bool(docx_token and found_docx_token == docx_token)
+    stale_registered_docx = bool(docx_token and not registered_docx_matched)
+    find_result.detail = {
         "report": str(report_file),
         "requested_name": name,
         "base_token_present": bool(base_token),
         "base_url": feishu_resource_url("base", base_token),
-        "docx_token_present": bool(created_doc.get("docx_token")),
-        "docx_url_present": bool(created_doc.get("url") or created_doc.get("docx_token")),
-        "docx_url": feishu_resource_url("docx", created_doc.get("docx_token"), created_doc.get("url")),
-        "block_id_present": bool(created_doc.get("block_id")),
-        "create_response_ok": create_ok,
+        "registered_docx_token_present": bool(existing_docx_token),
+        "docx_found": bool(found_docx_token),
+        "registered_docx_matched": registered_docx_matched,
+        "stale_registered_docx": stale_registered_docx,
+        "ambiguous": ambiguous,
+        "list_response_ok": find_ok,
         "dry_run": dry_run,
     }
-
-    results = [create_result]
-    if create_result.status != "ok":
+    results.append(find_result)
+    if find_result.status != "ok":
         return results
 
-    docx_token = created_doc.get("docx_token")
+    if found_docx_token:
+        created_doc = found_doc
+        docx_token = found_docx_token
+        reason = (
+            "using registered docx token verified by Base block list"
+            if registered_docx_matched
+            else "reusing existing docx block by name"
+        )
+        results.append(
+            StepResult(
+                f"base-doc-create:{category}",
+                "skipped",
+                detail={
+                    "reason": reason,
+                    "report": str(report_file),
+                    "requested_name": name,
+                    "base_token_present": bool(base_token),
+                    "base_url": feishu_resource_url("base", base_token),
+                    "docx_token_present": True,
+                    "docx_token": docx_token,
+                    "docx_url_present": bool(found_doc.get("url") or docx_token),
+                    "docx_url": feishu_resource_url("docx", docx_token, found_doc.get("url")),
+                    "block_id_present": bool(found_doc.get("block_id")),
+                    "stale_registered_docx": stale_registered_docx,
+                    "dry_run": dry_run,
+                },
+            )
+        )
+    else:
+        create_cmd = [
+            LARK_CLI_BIN,
+            "base",
+            "+base-block-create",
+            "--base-token",
+            base_token,
+            "--type",
+            "docx",
+            "--name",
+            name,
+            "--as",
+            "user",
+        ]
+        if dry_run:
+            create_cmd.append("--dry-run")
+
+        create_result = run_command(f"base-doc-create:{category}", create_cmd, timeout_seconds=timeout_seconds)
+        create_data = extract_json_object(create_result.stdout)
+        created_doc = parse_base_doc_block(create_data)
+        create_ok = create_data.get("ok") if create_data else None
+        if create_result.status == "ok" and not dry_run and create_ok is False:
+            create_result.status = "failed"
+            create_result.stderr = (create_result.stderr + "\nBase doc create returned ok=false.").strip()
+        create_result.detail = {
+            "report": str(report_file),
+            "requested_name": name,
+            "base_token_present": bool(base_token),
+            "base_url": feishu_resource_url("base", base_token),
+            "registered_docx_token_present": bool(existing_docx_token),
+            "stale_registered_docx": stale_registered_docx,
+            "docx_token_present": bool(created_doc.get("docx_token")),
+            "docx_token": created_doc.get("docx_token"),
+            "docx_url_present": bool(created_doc.get("url") or created_doc.get("docx_token")),
+            "docx_url": feishu_resource_url("docx", created_doc.get("docx_token"), created_doc.get("url")),
+            "block_id_present": bool(created_doc.get("block_id")),
+            "create_response_ok": create_ok,
+            "dry_run": dry_run,
+        }
+        results.append(create_result)
+        if create_result.status != "ok":
+            return results
+        docx_token = created_doc.get("docx_token")
+
     if not docx_token:
         status = "skipped" if dry_run else "failed"
         results.append(
@@ -601,6 +694,7 @@ def publish_report_doc_to_base(
             "doc_content": str(doc_content_file),
             "image_tags_removed": image_tags_removed,
             "docx_token_present": True,
+            "docx_token": docx_token,
             "docx_url_present": bool(created_doc.get("url") or docx_token),
             "docx_url": feishu_resource_url("docx", docx_token, created_doc.get("url")),
             "base_url": feishu_resource_url("base", base_token),
@@ -658,7 +752,7 @@ def category_publication_links(results: list[StepResult]) -> dict[str, dict[str,
                 continue
             detail = item.detail
             base_url = base_url or detail.get("base_url") or detail.get("copied_base_url")
-            doc_url = doc_url or detail.get("docx_url") or detail.get("document_url")
+            doc_url = doc_url or detail.get("docx_url") or detail.get("doc_url") or detail.get("document_url")
         links[category] = {
             "base_url": base_url if isinstance(base_url, str) else None,
             "doc_url": doc_url if isinstance(doc_url, str) else None,
@@ -754,8 +848,9 @@ def notification_idempotency_key(
 ) -> str:
     status = "ok" if workflow_complete(results) else "fail"
     report_date_part = report_date_text(report_date).replace("-", "")
+    link_fingerprint = json.dumps(category_publication_links(results), ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha1(
-        f"{report_date_part}:{status}:{recipient}:{problem_step_text(results)}".encode("utf-8")
+        f"{report_date_part}:{status}:{recipient}:{problem_step_text(results)}:{link_fingerprint}".encode("utf-8")
     ).hexdigest()[:8]
     return f"bsr-{report_date_part}-{status}-{digest}"
 
@@ -840,16 +935,6 @@ def print_result(result: StepResult) -> None:
         print(redact_output_text(result.stdout.strip()))
     if result.stderr.strip():
         print(redact_output_text(result.stderr.strip()), file=sys.stderr)
-
-
-def command_text(command: list[str] | None) -> str:
-    if not command:
-        return ""
-    return " ".join(shlex.quote(part) for part in command)
-
-
-def report_date_text(report_date: date | str) -> str:
-    return report_date.isoformat() if isinstance(report_date, date) else str(report_date)
 
 
 def display_local_path(path: Path) -> str:
@@ -937,6 +1022,7 @@ def write_run_report(
             folder_rename = detail.get("folder_rename") or {}
             block_layout = detail.get("block_layout") or {}
             server_verification = detail.get("server_verification") or {}
+            overwrite_recovery = detail.get("overwrite_recovery") or {}
             lines.extend(
                 [
                     "",
@@ -945,6 +1031,7 @@ def write_run_report(
                     f"- 左侧分组 CLI 重命名：{folder_rename.get('status') or '未执行'}",
                     f"- Base block 层级校验：{block_layout.get('status') or '未执行'}",
                     f"- 服务端回读校验：{server_verification.get('status') or '未执行'}",
+                    f"- overwrite 快照/恢复：{overwrite_recovery.get('status') or '未执行'}",
                     "",
                 ]
             )
@@ -1030,6 +1117,7 @@ def write_run_report(
             lines.extend(["```json", json.dumps(redact_detail(result.detail), ensure_ascii=False, indent=2), "```", ""])
 
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
 
 
 def write_workflow_outputs(
@@ -1055,6 +1143,7 @@ def write_workflow_outputs(
     }
     summary_path = log_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.chmod(summary_path, 0o600)
     report_path_out = log_dir / "run-report.md"
     write_run_report(report_path_out, report_date, dry_run, log_dir, results)
     return summary_path, report_path_out
@@ -1085,12 +1174,50 @@ def load_base_token_json(path: Path | None) -> dict[str, str]:
     return {str(k): str(v) for k, v in data.items()}
 
 
+def update_publication_registry(
+    registry: PublicationRegistry,
+    report_date: date,
+    category: str,
+    values: dict,
+    *,
+    dry_run: bool,
+) -> StepResult | None:
+    if dry_run:
+        return None
+    try:
+        registry.update(report_date, category, values)
+    except (OSError, PublicationRegistryError) as exc:
+        return StepResult(
+            f"publication-state:{category}",
+            "failed",
+            detail={
+                "reason": str(exc),
+                "registry": str(registry.path),
+                "requested_status": values.get("status"),
+            },
+        )
+    return StepResult(
+        f"publication-state:{category}",
+        "ok",
+        detail={
+            "registry": str(registry.path),
+            "status": values.get("status"),
+            "base_token_present": bool(values.get("base_token")),
+            "docx_token_present": bool(values.get("docx_token")),
+            "base_url": values.get("base_url"),
+            "doc_url": values.get("doc_url"),
+        },
+    )
+
+
 def main() -> int:
     load_dotenv()
+    command_runner_module.PROJECT_ROOT = PROJECT_ROOT
     global LARK_CLI_BIN
     LARK_CLI_BIN = os.environ.get("LARK_CLI_BIN", "lark-cli")
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--preflight", action="store_true", help="Run read-only production readiness checks and exit.")
     parser.add_argument("--date", help="Report date, YYYY-MM-DD. Defaults to recent finished Wednesday.")
     parser.add_argument("--dry-run", action="store_true", help="Do not write Doris/Base or final reports.")
     parser.add_argument("--skip-bsr", action="store_true")
@@ -1111,6 +1238,16 @@ def main() -> int:
     parser.add_argument("--no-copy-bases", action="store_true", help="Do not copy template Bases when token is missing.")
     parser.add_argument("--base-token", action="append", default=[], help="Optional override: CATEGORY=BASE_TOKEN.")
     parser.add_argument("--base-token-json", type=Path, help="Optional JSON object mapping category to Base token.")
+    parser.add_argument(
+        "--publication-state",
+        type=Path,
+        help="Local publication registry path. Defaults to state/publications.json under the project root.",
+    )
+    parser.add_argument(
+        "--force-new-publication",
+        action="store_true",
+        help="Ignore the publication registry and copy/create fresh Feishu Base/doc resources.",
+    )
     parser.add_argument("--skip-base-doc", action="store_true", help="Do not create/update the weekly report docx inside the Base sidebar.")
     parser.add_argument("--skip-notify", action="store_true", help="Do not send the final Feishu notification.")
     parser.add_argument("--notify-dry-run", action="store_true", help="Send the final Feishu notification even when --dry-run is set.")
@@ -1122,13 +1259,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--notify-user-id",
-        default=os.environ.get("FEISHU_NOTIFY_USER_ID", ""),
-        help="Feishu open_id (ou_xxx) that receives the final notification.",
+        default=env_first("FEISHU_NOTIFY_USER_ID", "LARK_REPORT_USER_ID"),
+        help="Feishu open_id (ou_xxx) that receives the final notification. Falls back to LARK_REPORT_USER_ID.",
     )
     parser.add_argument(
         "--notify-chat-id",
-        default=os.environ.get("FEISHU_NOTIFY_CHAT_ID", ""),
-        help="Feishu chat_id (oc_xxx) that receives the final notification. Takes precedence over --notify-user-id.",
+        default=env_first("FEISHU_NOTIFY_CHAT_ID", "LARK_REPORT_CHAT_ID"),
+        help="Feishu chat_id (oc_xxx) that receives the final notification. Takes precedence over --notify-user-id and falls back to LARK_REPORT_CHAT_ID.",
     )
     parser.add_argument(
         "--notify-as",
@@ -1139,9 +1276,21 @@ def main() -> int:
     parser.add_argument("--keep-going", action="store_true", help="Continue after a failed category step.")
     args = parser.parse_args()
 
+    if args.preflight:
+        results = run_preflight_checks(args)
+        for result in results:
+            print_result(result)
+        failed = [item.name for item in results if item.status == "failed"]
+        if failed:
+            print("PREFLIGHT_FAILED: " + ", ".join(failed))
+            return 1
+        print("PREFLIGHT_OK")
+        return 0
+
     run_id = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d-%H%M%S-%f")
     log_dir = PROJECT_ROOT / "logs" / "sorftime-weekly-workflow" / run_id
     log_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(log_dir, 0o700)
     results: list[StepResult] = []
 
     try:
@@ -1153,9 +1302,13 @@ def main() -> int:
 
         base_tokens = load_base_token_json(args.base_token_json)
         base_tokens.update(parse_base_tokens(args.base_token))
+        publication_state_path = args.publication_state or (PROJECT_ROOT / "state" / "publications.json")
+        publication_registry = PublicationRegistry(publication_state_path)
+        publication_registry.acquire_lock()
+        publication_registry.load()
         if args.no_overwrite_reports and not args.skip_base_sync:
             raise ValueError("--no-overwrite-reports cannot be used while Base sync is enabled")
-    except (ValueError, OSError, json.JSONDecodeError) as exc:
+    except (ValueError, OSError, json.JSONDecodeError, PublicationRegistryError) as exc:
         results.append(
             StepResult(
                 "argument-validation",
@@ -1211,7 +1364,6 @@ def main() -> int:
             report_date.isoformat(),
             "--weekday",
             "wednesday",
-            "--force",
             "--parallel",
             "--max-workers",
             str(args.max_workers),
@@ -1270,7 +1422,29 @@ def main() -> int:
             results.append(StepResult(f"base-sync:{category}", "skipped", detail={"reason": "--skip-base-sync"}))
             continue
 
+        publication_entry = publication_registry.get(report_date, category)
+        explicit_token_present = category in base_tokens
         token = base_tokens.get(category)
+        if not token and not args.force_new_publication:
+            registry_token = publication_entry.get("base_token")
+            if isinstance(registry_token, str) and registry_token:
+                token = registry_token
+                base_tokens[category] = token
+                results.append(
+                    StepResult(
+                        f"base-copy:{category}",
+                        "ok",
+                        detail={
+                            "reason": "using publication registry base token",
+                            "requested_name": publication_entry.get("base_name")
+                            or f"{report_date:%Y%m%d}{category}周趋势监测报告数据",
+                            "copied_base_token_present": True,
+                            "copied_base_url_present": bool(publication_entry.get("base_url")),
+                            "copied_base_url": publication_entry.get("base_url") or feishu_resource_url("base", token),
+                            "registry": str(publication_registry.path),
+                        },
+                    )
+                )
         path = report_path(report_date, category, args.report_dir)
         if not token:
             if args.no_copy_bases:
@@ -1299,6 +1473,25 @@ def main() -> int:
                 continue
             if token:
                 base_tokens[category] = token
+                state_result = update_publication_registry(
+                    publication_registry,
+                    report_date,
+                    category,
+                    {
+                        "base_token": token,
+                        "base_url": (copy_result.detail or {}).get("copied_base_url") or feishu_resource_url("base", token),
+                        "base_name": (copy_result.detail or {}).get("requested_name"),
+                        "status": "base_copied",
+                        "last_run_id": run_id,
+                    },
+                    dry_run=args.dry_run,
+                )
+                if state_result:
+                    results.append(state_result)
+                    print_result(state_result)
+                    if state_result.status == "failed":
+                        abort_remaining = True
+                        continue
             else:
                 results.append(
                     StepResult(
@@ -1350,11 +1543,57 @@ def main() -> int:
         result.detail["base_url"] = feishu_resource_url("base", token)
         results.append(result)
         print_result(result)
-        if stop_on_failure and result.status == "failed":
-            abort_remaining = True
-            continue
         if result.status != "ok":
+            state_result = update_publication_registry(
+                publication_registry,
+                report_date,
+                category,
+                {
+                    "base_token": token,
+                    "base_url": feishu_resource_url("base", token),
+                    "base_name": publication_entry.get("base_name")
+                    or f"{report_date:%Y%m%d}{category}周趋势监测报告数据",
+                    "status": "failed",
+                    "last_run_id": run_id,
+                    "last_error": "base sync failed",
+                },
+                dry_run=args.dry_run,
+            )
+            if state_result:
+                results.append(state_result)
+                print_result(state_result)
+            if stop_on_failure and result.status == "failed":
+                abort_remaining = True
             continue
+        can_reuse_registered_doc = (
+            not args.force_new_publication
+            and not explicit_token_present
+            and publication_entry.get("base_token") == token
+            and bool(publication_entry.get("docx_token"))
+        )
+        state_result = update_publication_registry(
+            publication_registry,
+            report_date,
+            category,
+            {
+                "base_token": token,
+                "base_url": feishu_resource_url("base", token),
+                "base_name": publication_entry.get("base_name")
+                or f"{report_date:%Y%m%d}{category}周趋势监测报告数据",
+                "docx_token": publication_entry.get("docx_token") if can_reuse_registered_doc else "",
+                "doc_url": publication_entry.get("doc_url") if can_reuse_registered_doc else "",
+                "doc_name": publication_entry.get("doc_name") if can_reuse_registered_doc else "",
+                "status": "base_synced",
+                "last_run_id": run_id,
+            },
+            dry_run=args.dry_run,
+        )
+        if state_result:
+            results.append(state_result)
+            print_result(state_result)
+            if state_result.status == "failed":
+                abort_remaining = True
+                continue
         if args.skip_base_doc:
             results.append(
                 StepResult(
@@ -1372,12 +1611,40 @@ def main() -> int:
             dry_run=args.dry_run,
             timeout_seconds=args.command_timeout_seconds,
             doc_content_dir=log_dir / "base-doc-content",
+            existing_docx_token=publication_entry.get("docx_token") if can_reuse_registered_doc else None,
+            existing_docx_url=publication_entry.get("doc_url") if can_reuse_registered_doc else None,
         )
         results.extend(doc_results)
         for doc_result in doc_results:
             print_result(doc_result)
         if stop_on_failure and any(item.status == "failed" for item in doc_results):
             abort_remaining = True
+            continue
+        doc_update = category_step(doc_results, "base-doc-update", category)
+        if doc_update and doc_update.status == "ok":
+            doc_detail = doc_update.detail or {}
+            state_result = update_publication_registry(
+                publication_registry,
+                report_date,
+                category,
+                {
+                    "base_token": token,
+                    "base_url": doc_detail.get("base_url") or feishu_resource_url("base", token),
+                    "base_name": publication_entry.get("base_name")
+                    or f"{report_date:%Y%m%d}{category}周趋势监测报告数据",
+                    "docx_token": doc_detail.get("docx_token"),
+                    "doc_url": doc_detail.get("docx_url"),
+                    "doc_name": report_doc_name(report_date, category),
+                    "status": "success",
+                    "last_run_id": run_id,
+                },
+                dry_run=args.dry_run,
+            )
+            if state_result:
+                results.append(state_result)
+                print_result(state_result)
+                if state_result.status == "failed":
+                    abort_remaining = True
 
     summary_path, report_path_out = write_workflow_outputs(log_dir, report_date, args.dry_run, results)
     if not args.skip_notify:

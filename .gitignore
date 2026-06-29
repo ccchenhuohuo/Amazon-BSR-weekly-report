@@ -8,6 +8,7 @@ logs/
 output/
 reports/
 dist/
+state/
 
 # Python/runtime artifacts
 .venv/

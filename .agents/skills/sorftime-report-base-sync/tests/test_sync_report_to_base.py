@@ -558,6 +558,81 @@ def test_verify_written_records_reads_back_counts_and_cells(monkeypatch):
     assert result["issues"] == []
 
 
+def test_restore_snapshot_records_recreates_old_rows(tmp_path, monkeypatch):
+    snapshot_path = tmp_path / "snapshots" / "异动数据.json"
+    snapshot_path.parent.mkdir()
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "table": "异动数据",
+                "table_id": "tbl-1",
+                "record_count": 1,
+                "records": [
+                    {
+                        "record_id": "rec-1",
+                        "fields": {
+                            "ASIN": "[X012345678](https://www.amazon.com/dp/X012345678)",
+                            "类目": "Continuous Output Lighting",
+                            "商品图片": "https://example.com/a.jpg",
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_clear_table(base_token, table_id, dry_run):
+        calls.append(("clear", base_token, table_id, dry_run))
+        return 1
+
+    def fake_run_cli(args, dry_run=False, allow_failure=False):
+        calls.append(("run_cli", args, dry_run))
+        return {"ok": True}
+
+    monkeypatch.setattr(sync_report_to_base, "clear_table", fake_clear_table)
+    monkeypatch.setattr(sync_report_to_base, "run_cli", fake_run_cli)
+    monkeypatch.setattr(sync_report_to_base, "list_records", lambda base_token, table_id: [{"fields": {"ASIN": "x"}}])
+
+    result = sync_report_to_base.restore_snapshot_records(
+        "base-token",
+        "异动数据",
+        "tbl-1",
+        {"path": str(snapshot_path)},
+        dry_run=False,
+        log_dir=tmp_path,
+    )
+
+    assert result == {"table": "异动数据", "status": "ok", "restored": 1, "actual": 1}
+    assert calls[0] == ("clear", "base-token", "tbl-1", False)
+    batch_call = calls[1][1]
+    assert batch_call[:2] == ["base", "+record-batch-create"]
+    payload = json.loads(Path(batch_call[batch_call.index("--json") + 1][1:]).read_text(encoding="utf-8"))
+    assert payload["fields"] == ["ASIN", "类目", "商品图片"]
+    assert payload["rows"][0][0] == "[X012345678](https://www.amazon.com/dp/X012345678)"
+
+
+def test_restore_overwrite_snapshots_captures_restore_exceptions(tmp_path, monkeypatch):
+    def fake_restore(*args, **kwargs):
+        raise sync_report_to_base.SyncError("restore exploded")
+
+    monkeypatch.setattr(sync_report_to_base, "restore_snapshot_records", fake_restore)
+
+    result = sync_report_to_base.restore_overwrite_snapshots(
+        "base-token",
+        {"异动数据": "tbl-1"},
+        {"异动数据": {"path": str(tmp_path / "snapshot.json")}},
+        dry_run=False,
+        log_dir=tmp_path,
+    )
+
+    assert result["status"] == "failed"
+    assert result["restore_failures"]["异动数据"]["status"] == "failed"
+    assert "restore exploded" in result["restore_failures"]["异动数据"]["reason"]
+
+
 def test_verify_written_records_retries_until_server_counts_match(monkeypatch):
     rows = {
         "异动数据": [
