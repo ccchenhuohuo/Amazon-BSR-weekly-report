@@ -2,6 +2,8 @@
 .env
 *.env
 .env.local
+.env.*
+!.env.example
 
 # Generated automation outputs
 logs/
@@ -9,6 +11,10 @@ output/
 reports/
 dist/
 state/
+**/state/
+*.state
+*.lock
+larksuite-cli-data/
 
 # Python/runtime artifacts
 .venv/

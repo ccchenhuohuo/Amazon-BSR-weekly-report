@@ -1,3 +1,4 @@
+import argparse
 import json
 import importlib.util
 import os
@@ -189,6 +190,109 @@ def test_runner_preflight_returns_without_workflow_log(tmp_path, monkeypatch, ca
     assert runner.main() == 0
     assert "PREFLIGHT_OK" in capsys.readouterr().out
     assert not (tmp_path / "logs" / "sorftime-weekly-workflow").exists()
+
+
+def preflight_args(tmp_path, **overrides):
+    values = {
+        "date": "2026-06-24",
+        "publication_state": tmp_path / "state" / "publications.json",
+        "base_token_json": None,
+        "base_token": [],
+        "skip_base_sync": False,
+        "template_base_token": "",
+        "no_copy_bases": False,
+        "force_new_publication": False,
+        "require_notify": False,
+        "notify_chat_id": "",
+        "notify_user_id": "",
+        "command_timeout_seconds": 120,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def prepare_preflight_monkeypatch(monkeypatch):
+    monkeypatch.setattr(runner, "required_runtime_paths", lambda: [])
+    monkeypatch.setattr(runner, "dependency_import_status", lambda: {})
+    monkeypatch.setattr(
+        runner,
+        "lark_cli_status",
+        lambda: {"configured": "lark-cli", "resolved": "/usr/local/bin/lark-cli", "exists": True, "executable": True},
+    )
+    monkeypatch.setattr(
+        runner,
+        "run_command",
+        lambda name, command, timeout_seconds: runner.StepResult(name=name, status="ok", returncode=0),
+    )
+
+
+def base_token_preflight_result(results):
+    return next(item for item in results if item.name == "preflight:base-token-config")
+
+
+def test_preflight_fails_when_registry_exists_without_current_base_tokens(tmp_path, monkeypatch):
+    prepare_preflight_monkeypatch(monkeypatch)
+    registry_path = tmp_path / "state" / "publications.json"
+    registry_path.parent.mkdir()
+    registry_path.write_text(json.dumps({"2026-06-17": {"灯光类": {"base_token": "old"}}}), encoding="utf-8")
+
+    result = base_token_preflight_result(runner.run_preflight_checks(preflight_args(tmp_path)))
+
+    assert result.status == "failed"
+    assert result.detail["report_date"] == "2026-06-24"
+    assert result.detail["publication_registry_present"] is True
+    assert result.detail["missing_categories"] == list(runner.CATEGORIES)
+
+
+def test_preflight_uses_current_date_registry_base_tokens(tmp_path, monkeypatch):
+    prepare_preflight_monkeypatch(monkeypatch)
+    registry_path = tmp_path / "state" / "publications.json"
+    registry_path.parent.mkdir()
+    registry_path.write_text(
+        json.dumps(
+            {
+                "2026-06-24": {
+                    category: {"base_token": f"base-{idx}"}
+                    for idx, category in enumerate(runner.CATEGORIES, start=1)
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = base_token_preflight_result(runner.run_preflight_checks(preflight_args(tmp_path)))
+
+    assert result.status == "ok"
+    assert result.detail["registry_categories"] == list(runner.CATEGORIES)
+    assert result.detail["missing_categories"] == []
+
+
+def test_preflight_force_new_publication_ignores_registry_tokens(tmp_path, monkeypatch):
+    prepare_preflight_monkeypatch(monkeypatch)
+    registry_path = tmp_path / "state" / "publications.json"
+    registry_path.parent.mkdir()
+    registry_path.write_text(
+        json.dumps(
+            {
+                "2026-06-24": {
+                    category: {"base_token": f"base-{idx}"}
+                    for idx, category in enumerate(runner.CATEGORIES, start=1)
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = base_token_preflight_result(
+        runner.run_preflight_checks(preflight_args(tmp_path, force_new_publication=True))
+    )
+
+    assert result.status == "failed"
+    assert result.detail["force_new_publication"] is True
+    assert result.detail["registry_categories"] == []
+    assert result.detail["missing_categories"] == list(runner.CATEGORIES)
 
 
 def test_runner_main_full_publish_path_sends_notification(tmp_path, monkeypatch):

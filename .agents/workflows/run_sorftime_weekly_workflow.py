@@ -152,6 +152,26 @@ def lark_cli_status() -> dict[str, object]:
     }
 
 
+def resolve_report_date(value: str | None) -> date:
+    if value:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    return most_recent_finished_wednesday()
+
+
+def registry_base_token_categories(registry_path: Path, report_date: date) -> list[str]:
+    registry = PublicationRegistry(registry_path)
+    data = registry.load()
+    report_entry = data.get(report_date.isoformat(), {})
+    if not isinstance(report_entry, dict):
+        return []
+    categories: list[str] = []
+    for category in CATEGORIES:
+        entry = report_entry.get(category, {})
+        if isinstance(entry, dict) and isinstance(entry.get("base_token"), str) and entry["base_token"]:
+            categories.append(category)
+    return categories
+
+
 def run_preflight_checks(args: argparse.Namespace) -> list[StepResult]:
     results: list[StepResult] = []
 
@@ -211,7 +231,13 @@ def run_preflight_checks(args: argparse.Namespace) -> list[StepResult]:
     try:
         base_tokens = load_base_token_json(args.base_token_json)
         base_tokens.update(parse_base_tokens(args.base_token))
-    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        report_date = resolve_report_date(args.date)
+        registry_categories = (
+            []
+            if args.force_new_publication
+            else registry_base_token_categories(registry_path, report_date)
+        )
+    except (ValueError, OSError, json.JSONDecodeError, PublicationRegistryError) as exc:
         results.append(
             StepResult(
                 "preflight:base-token-config",
@@ -220,23 +246,38 @@ def run_preflight_checks(args: argparse.Namespace) -> list[StepResult]:
             )
         )
     else:
-        missing_explicit_tokens = [category for category in CATEGORIES if category not in base_tokens]
-        can_prepare_bases = (
-            args.skip_base_sync
-            or args.template_base_token
-            or args.no_copy_bases
-            or not missing_explicit_tokens
-            or registry_path.exists()
-        )
+        explicit_categories = [category for category in CATEGORIES if category in base_tokens]
+        template_can_copy = bool(args.template_base_token) and not args.no_copy_bases
+        sources: dict[str, str] = {}
+        missing_categories: list[str] = []
+        for category in CATEGORIES:
+            if args.skip_base_sync:
+                sources[category] = "skipped"
+            elif category in explicit_categories:
+                sources[category] = "explicit"
+            elif category in registry_categories:
+                sources[category] = "publication_registry"
+            elif template_can_copy:
+                sources[category] = "template_base"
+            else:
+                sources[category] = "missing"
+                missing_categories.append(category)
         results.append(
             StepResult(
                 "preflight:base-token-config",
-                "ok" if can_prepare_bases else "failed",
+                "ok" if args.skip_base_sync or not missing_categories else "failed",
                 detail={
+                    "report_date": report_date.isoformat(),
                     "skip_base_sync": args.skip_base_sync,
                     "template_base_token_present": bool(args.template_base_token),
+                    "template_can_copy": template_can_copy,
+                    "publication_registry": str(registry_path),
                     "publication_registry_present": registry_path.exists(),
-                    "missing_explicit_categories": missing_explicit_tokens,
+                    "force_new_publication": args.force_new_publication,
+                    "explicit_categories": explicit_categories,
+                    "registry_categories": registry_categories,
+                    "missing_categories": missing_categories,
+                    "category_sources": sources,
                     "no_copy_bases": args.no_copy_bases,
                 },
             )
@@ -1294,11 +1335,7 @@ def main() -> int:
     results: list[StepResult] = []
 
     try:
-        report_date = (
-            datetime.strptime(args.date, "%Y-%m-%d").date()
-            if args.date
-            else most_recent_finished_wednesday()
-        )
+        report_date = resolve_report_date(args.date)
 
         base_tokens = load_base_token_json(args.base_token_json)
         base_tokens.update(parse_base_tokens(args.base_token))

@@ -48,6 +48,18 @@ from report_parser import (
 )
 
 ATTACHMENT_FIELDS = {"附件", "附图"}
+READONLY_FIELD_TYPES = {
+    "auto_number",
+    "created_time",
+    "created_user",
+    "formula",
+    "last_modified_time",
+    "lookup",
+    "modified_time",
+    "modified_user",
+    "rollup",
+}
+READONLY_FIELD_FLAGS = ("readonly", "read_only", "is_readonly", "is_read_only", "is_system", "system")
 DEFAULT_TEMPLATE_BASE_TOKEN = os.environ.get("FEISHU_TEMPLATE_BASE_TOKEN", "")
 LARK_CLI_BIN = os.environ.get("LARK_CLI_BIN", "lark-cli")
 LARK_CLI_TIMEOUT_SECONDS = int(os.environ.get("LARK_CLI_TIMEOUT_SECONDS", "240"))
@@ -125,14 +137,18 @@ def redact_text_for_log(text: str | None) -> str:
     return redact_local_paths(redacted)
 
 
-def redact_json_for_log(value: Any, key: str = "") -> Any:
+def redact_json_for_log(value: Any, key: str = "", inherited_sensitive: bool = False) -> Any:
     lowered = key.lower()
+    sensitive = inherited_sensitive or any(part in lowered for part in ("token", "password", "secret", "api_key", "url"))
     if isinstance(value, dict):
-        return {item_key: redact_json_for_log(item_value, item_key) for item_key, item_value in value.items()}
+        return {
+            item_key: redact_json_for_log(item_value, item_key, sensitive)
+            for item_key, item_value in value.items()
+        }
     if isinstance(value, list):
-        return [redact_json_for_log(item) for item in value]
+        return [redact_json_for_log(item, key, sensitive) for item in value]
     if isinstance(value, str):
-        if any(part in lowered for part in ("token", "password", "secret", "api_key", "url")):
+        if sensitive:
             return "[REDACTED]" if value else value
         return redact_text_for_log(value)
     return value
@@ -228,6 +244,29 @@ def table_map(base_token: str) -> dict[str, str]:
 def field_map(base_token: str, table_id: str) -> dict[str, dict[str, Any]]:
     data = run_cli(["base", "+field-list", "--base-token", base_token, "--table-id", table_id, "--limit", "200"])
     return {item["name"]: item for item in data["data"]["fields"]}
+
+
+def field_flag(meta: dict[str, Any], flag_names: tuple[str, ...]) -> bool:
+    for flag in flag_names:
+        if meta.get(flag) is True:
+            return True
+    properties = meta.get("property")
+    if isinstance(properties, dict):
+        return any(properties.get(flag) is True for flag in flag_names)
+    return False
+
+
+def is_writable_field(field_name: str, field: dict[str, Any]) -> bool:
+    field_type = str(field.get("type") or "").lower()
+    if field_name in ATTACHMENT_FIELDS or field_type == "attachment":
+        return False
+    if field_type in READONLY_FIELD_TYPES:
+        return False
+    return not field_flag(field, READONLY_FIELD_FLAGS)
+
+
+def writable_field_names(fields: dict[str, dict[str, Any]]) -> list[str]:
+    return [name for name, field in fields.items() if is_writable_field(name, field)]
 
 
 def list_base_blocks(base_token: str, block_type: str | None = None) -> list[dict[str, Any]]:
@@ -615,7 +654,7 @@ def write_records(
     dry_run: bool,
     log_dir: Path,
 ) -> None:
-    writable = [name for name in fields if name not in ATTACHMENT_FIELDS and fields[name].get("type") != "attachment"]
+    writable = writable_field_names(fields)
     record_keys = collections.OrderedDict()
     for record in records:
         for key in record:
@@ -747,16 +786,35 @@ def restore_snapshot_records(
         clear_table(base_token, table_id, dry_run=False)
         return {"table": table_name, "status": "ok", "restored": 0}
 
+    try:
+        current_fields = field_map(base_token, table_id)
+    except Exception as exc:
+        return {"table": table_name, "status": "failed", "reason": str(exc), "restored": 0}
+
+    writable = writable_field_names(current_fields)
     field_order = collections.OrderedDict()
+    skipped_fields = collections.OrderedDict()
     row_fields: list[dict[str, Any]] = []
     for record in records:
         fields = record_fields(record) if isinstance(record, dict) else {}
-        row_fields.append(fields)
-        for field_name in fields:
+        filtered: dict[str, Any] = {}
+        for field_name, value in fields.items():
+            if field_name not in current_fields or field_name not in writable:
+                skipped_fields[field_name] = None
+                continue
+            filtered[field_name] = convert_for_field(value, current_fields[field_name])
             field_order[field_name] = None
-    fields = list(field_order)
+        row_fields.append(filtered)
+    fields = [field_name for field_name in writable if field_name in field_order]
     if not fields:
-        return {"table": table_name, "status": "failed", "reason": "snapshot records have no fields", "restored": 0}
+        return {
+            "table": table_name,
+            "status": "failed",
+            "reason": "snapshot records have no writable fields",
+            "restored": 0,
+            "filtered_fields": [],
+            "skipped_fields": list(skipped_fields),
+        }
 
     clear_table(base_token, table_id, dry_run=False)
     for start in range(0, len(row_fields), 200):
@@ -786,8 +844,17 @@ def restore_snapshot_records(
             "expected": len(row_fields),
             "actual": actual_count,
             "restored": len(row_fields),
+            "filtered_fields": fields,
+            "skipped_fields": list(skipped_fields),
         }
-    return {"table": table_name, "status": "ok", "restored": len(row_fields), "actual": actual_count}
+    return {
+        "table": table_name,
+        "status": "ok",
+        "restored": len(row_fields),
+        "actual": actual_count,
+        "filtered_fields": fields,
+        "skipped_fields": list(skipped_fields),
+    }
 
 
 def restore_overwrite_snapshots(

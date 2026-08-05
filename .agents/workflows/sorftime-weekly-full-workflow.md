@@ -243,6 +243,7 @@ FEISHU_REQUIRE_NOTIFY=1
 - `.agents/workflows/command_runner.py` 使用独立 process group 执行子命令；超时时会杀掉整个进程组，避免 lark-cli 等孙进程继续写入。
 - runner 会解析 Base sync 末尾 JSON，结构化汇总三张母表、十二张子表记录数、重复检查结果和 Base sync 日志目录。
 - runner 会在 Base 左侧栏新增周报 docx 文档，并在流程结束后通过飞书机器人发送完成/异常通知。
+- 可选质量基线：可运行 `.venv/bin/python -m pytest --cov=.agents --cov-report=term-missing` 观察覆盖率，不设置最低阈值；依赖漏洞审计优先运行 `pip-audit -r requirements.lock`，工具或 lock 不存在时记录跳过原因即可。
 - ProductRequest 旁路流程已修复两个审查问题：`transform_product.py` 不再输出 Stream Load columns 之外的 `photo` 字段；`DatabaseConfig` 直接构造时 `stream_load_host` 会回退到 `host`。注意：最终周报和 Base 的 `商品图片` URL 来自 CategoryRequest 同步后的配置表 `photo` 字段，不是 ProductRequest 旁路表。
 - Chrome/Computer Use 左侧分组重命名保留为人工 fallback，不作为默认自动化步骤。
 

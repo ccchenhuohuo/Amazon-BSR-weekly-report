@@ -595,6 +595,15 @@ def test_restore_snapshot_records_recreates_old_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(sync_report_to_base, "clear_table", fake_clear_table)
     monkeypatch.setattr(sync_report_to_base, "run_cli", fake_run_cli)
     monkeypatch.setattr(sync_report_to_base, "list_records", lambda base_token, table_id: [{"fields": {"ASIN": "x"}}])
+    monkeypatch.setattr(
+        sync_report_to_base,
+        "field_map",
+        lambda base_token, table_id: {
+            "ASIN": {"name": "ASIN", "type": "text"},
+            "类目": {"name": "类目", "type": "text"},
+            "商品图片": {"name": "商品图片", "type": "text"},
+        },
+    )
 
     result = sync_report_to_base.restore_snapshot_records(
         "base-token",
@@ -605,13 +614,98 @@ def test_restore_snapshot_records_recreates_old_rows(tmp_path, monkeypatch):
         log_dir=tmp_path,
     )
 
-    assert result == {"table": "异动数据", "status": "ok", "restored": 1, "actual": 1}
+    assert result == {
+        "table": "异动数据",
+        "status": "ok",
+        "restored": 1,
+        "actual": 1,
+        "filtered_fields": ["ASIN", "类目", "商品图片"],
+        "skipped_fields": [],
+    }
     assert calls[0] == ("clear", "base-token", "tbl-1", False)
     batch_call = calls[1][1]
     assert batch_call[:2] == ["base", "+record-batch-create"]
     payload = json.loads(Path(batch_call[batch_call.index("--json") + 1][1:]).read_text(encoding="utf-8"))
     assert payload["fields"] == ["ASIN", "类目", "商品图片"]
     assert payload["rows"][0][0] == "[X012345678](https://www.amazon.com/dp/X012345678)"
+
+
+def test_redact_json_for_log_keeps_sensitive_parent_key_for_lists():
+    value = {
+        "base_tokens": ["base_real_token"],
+        "tokens": [{"value": "nested_real_token"}],
+        "doc_urls": ["https://ulanzichina.feishu.cn/docx/real_doc_token"],
+    }
+
+    assert sync_report_to_base.redact_json_for_log(value) == {
+        "base_tokens": ["[REDACTED]"],
+        "tokens": [{"value": "[REDACTED]"}],
+        "doc_urls": ["[REDACTED]"],
+    }
+
+
+def test_restore_snapshot_records_filters_unwritable_fields(tmp_path, monkeypatch):
+    snapshot_path = tmp_path / "snapshots" / "异动数据.json"
+    snapshot_path.parent.mkdir()
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "table": "异动数据",
+                "table_id": "tbl-1",
+                "record_count": 1,
+                "records": [
+                    {
+                        "record_id": "rec-1",
+                        "fields": {
+                            "ASIN": "X012345678",
+                            "附图": [{"file_token": "box-real-token"}],
+                            "系统编号": "AUTO-1",
+                            "只读说明": "readonly",
+                            "不存在字段": "drop-me",
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    payload_paths: list[Path] = []
+
+    monkeypatch.setattr(sync_report_to_base, "clear_table", lambda base_token, table_id, dry_run: 1)
+    monkeypatch.setattr(sync_report_to_base, "list_records", lambda base_token, table_id: [{"fields": {"ASIN": "x"}}])
+    monkeypatch.setattr(
+        sync_report_to_base,
+        "field_map",
+        lambda base_token, table_id: {
+            "ASIN": {"name": "ASIN", "type": "text"},
+            "附图": {"name": "附图", "type": "attachment"},
+            "系统编号": {"name": "系统编号", "type": "auto_number"},
+            "只读说明": {"name": "只读说明", "type": "text", "is_readonly": True},
+        },
+    )
+
+    def fake_run_cli(args, dry_run=False, allow_failure=False):
+        payload_paths.append(Path(args[args.index("--json") + 1][1:]))
+        return {"ok": True}
+
+    monkeypatch.setattr(sync_report_to_base, "run_cli", fake_run_cli)
+
+    result = sync_report_to_base.restore_snapshot_records(
+        "base-token",
+        "异动数据",
+        "tbl-1",
+        {"path": str(snapshot_path)},
+        dry_run=False,
+        log_dir=tmp_path,
+    )
+
+    assert result["status"] == "ok"
+    assert result["filtered_fields"] == ["ASIN"]
+    assert result["skipped_fields"] == ["附图", "系统编号", "只读说明", "不存在字段"]
+    payload = json.loads(payload_paths[0].read_text(encoding="utf-8"))
+    assert payload["fields"] == ["ASIN"]
+    assert payload["rows"] == [["X012345678"]]
 
 
 def test_restore_overwrite_snapshots_captures_restore_exceptions(tmp_path, monkeypatch):
