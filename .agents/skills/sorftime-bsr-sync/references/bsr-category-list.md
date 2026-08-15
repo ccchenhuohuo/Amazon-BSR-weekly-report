@@ -9,27 +9,42 @@ created: 2025-12-01
 
 # Sorftime 类目 mapping
 
-## 脚架类
-
-| 完整路径                                                   | node_id     |
-| ------------------------------------------------------ | ----------- |
-| Camera & Photo > Tripods & Monopods > Complete Tripods | 499310      |
-| Accessories > Photo & Video Accessories > Tripods      | 11139610011 |
-
-## 支架类
-
-| 完整路径                                              | node_id     |
-| ------------------------------------------------- | ----------- |
-| Accessories > Automobile Accessories > Cradles    | 7072562011  |
-| Accessories > Grips                               | 21209098011 |
-
-
 ## 灯光类
 
 | 完整路径 | node_id |
-|---------|---------|
+| --- | --- |
 | Camera & Photo > Lighting & Studio > Lighting > Continuous Output Lighting | 3347881 |
 | Accessories > Photo & Video Accessories > Flashes & Selfie Lights > Selfie Lights | 23658829011 |
+| Electronics > Camera & Photo > Video > Lighting > On-Camera Video Lights | 3109915011 |
+
+## 支架类
+
+| 完整路径 | node_id |
+| --- | --- |
+| Accessories > Automobile Accessories > Cradles | 7072562011 |
+| Accessories > Grips | 21209098011 |
+| Cell Phones & Accessories > Accessories > Stands | 23690036011 |
+| Camera & Photo Products > Accessories > Tripod & Monopod Accessories > Camera Mounts & Clamps | 3347851 |
+
+## 脚架类
+
+| 完整路径 | node_id |
+| --- | --- |
+| Camera & Photo > Tripods & Monopods > Complete Tripods | 499310 |
+| Accessories > Photo & Video Accessories > Tripods | 11139610011 |
+| Cell Phones & Accessories > Accessories > Photo & Video Accessories > Selfie Sticks | 11139608011 |
+
+## 音视频类
+
+| 完整路径 | node_id |
+| --- | --- |
+| Camera & Photo Products > Accessories > Professional Video Accessories > Professional Video Microphones | 196575011 |
+
+## 智能工作室类
+
+| 完整路径 | node_id |
+| --- | --- |
+| Musical Instruments > Studio Recording Equipment > Computer Recording > Digital Audio Workstation Controllers | 11973701 |
 
 ## 关联笔记
 - Sorftime API Doc — 使用本文档中 Node ID 的 API

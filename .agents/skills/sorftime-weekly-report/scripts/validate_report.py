@@ -15,28 +15,7 @@ FORBIDDEN_PATTERNS = [
     r"\|\s*\|\s*\|",
 ]
 
-REQUIRED_HEADINGS = [
-    "# {category}周趋势监测报告",
-    "## 一、数据概览",
-    "### 1.1 核心指标对比",
-    "### 1.2 核心结论",
-    "## 二、{category_a}产品分析",
-    "### 2.1 TOP10产品",
-    "### 2.2 强势上升产品",
-    "### 2.3 强势下降产品",
-    "### 2.4 新上榜产品追踪",
-    "### 2.5 {category_a}低分高销洞察",
-    "## 三、{category_b}产品分析",
-    "### 3.1 TOP10产品",
-    "### 3.2 强势上升产品",
-    "### 3.3 强势下降产品",
-    "### 3.4 新上榜产品追踪",
-    "### 3.5 {category_b}低分高销洞察",
-    "## 四、ULANZI本品专题分析",
-    "### 4.1 周度产品线明细",
-    "### 4.2 品牌销售效率全面对比分析",
-    "## 五、本周市场格局总结",
-]
+CHINESE_NUMBERS = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七"}
 
 
 def fail(message: str) -> None:
@@ -113,14 +92,15 @@ def assert_first_table_rows(text: str, marker: str, expected: int | None = None,
         fail(f"{marker} has {count} rows, expected at most {maximum}")
 
 
-def assert_overview_top3(text: str) -> None:
+def assert_overview_top3(text: str, category_count: int) -> None:
     rows = first_table_rows(section_after(text, "### 1.1 核心指标对比"))
     top_rows = [row for row in rows if re.match(r"\|\s*\*\*TOP[123]产品\*\*", row)]
     if len(top_rows) != 3:
         fail(f"overview TOP rows expected 3, got {len(top_rows)}")
     for row in top_rows:
-        if row.count("https://www.amazon.com/dp/") != 4:
-            fail("each overview TOP row must include 4 ASIN links")
+        expected_links = category_count * 2
+        if row.count("https://www.amazon.com/dp/") != expected_links:
+            fail(f"each overview TOP row must include {expected_links} ASIN links")
 
 
 def assert_marker_table(text: str, marker: str, expected: int | None = None, minimum: int | None = None) -> None:
@@ -145,7 +125,22 @@ def assert_prices_and_links(text: str) -> None:
         fail("missing valid ASIN Amazon links")
 
 
-def validate(path: Path, category: str, category_a: str, category_b: str, image_width: int = 150) -> None:
+def validate(
+    path: Path,
+    category: str,
+    categories: list[str] | str,
+    category_b: str | None = None,
+    image_width: int = 150,
+) -> None:
+    if isinstance(categories, str):
+        category_names = [categories]
+        if category_b:
+            category_names.append(category_b)
+    else:
+        category_names = list(categories)
+    if not 1 <= len(category_names) <= 4:
+        fail(f"expected 1-4 report categories, got {len(category_names)}")
+
     text = path.read_text(encoding="utf-8")
 
     for pattern in FORBIDDEN_PATTERNS:
@@ -153,55 +148,70 @@ def validate(path: Path, category: str, category_a: str, category_b: str, image_
         if match:
             fail(f"forbidden pattern {pattern!r} at character {match.start()}")
 
-    for heading in REQUIRED_HEADINGS:
-        expected = heading.format(category=category, category_a=category_a, category_b=category_b)
+    required_headings = [
+        f"# {category}周趋势监测报告",
+        "## 一、数据概览",
+        "### 1.1 核心指标对比",
+        "### 1.2 核心结论",
+    ]
+    for index, category_name in enumerate(category_names, 2):
+        required_headings.extend([
+            f"## {CHINESE_NUMBERS[index]}、{category_name}产品分析",
+            f"### {index}.1 TOP10产品",
+            f"### {index}.2 强势上升产品",
+            f"### {index}.3 强势下降产品",
+            f"### {index}.4 新上榜产品追踪",
+            f"### {index}.5 {category_name}低分高销洞察",
+        ])
+    ulanzi_chapter = len(category_names) + 2
+    summary_chapter = ulanzi_chapter + 1
+    required_headings.extend([
+        f"## {CHINESE_NUMBERS[ulanzi_chapter]}、ULANZI本品专题分析",
+        f"### {ulanzi_chapter}.1 周度产品线明细",
+        f"### {ulanzi_chapter}.2 品牌销售效率全面对比分析",
+        f"## {CHINESE_NUMBERS[summary_chapter]}、本周市场格局总结",
+    ])
+    for expected in required_headings:
         if expected not in text:
             fail(f"missing required heading: {expected}")
 
     assert_prices_and_links(text)
     assert_photo_format(text, image_width=image_width)
-    assert_overview_top3(text)
+    assert_overview_top3(text, len(category_names))
 
-    assert_rows(text, "#### 2.1.1 TOP10产品", expected=10)
-    assert_rows(text, "### 2.2 强势上升产品", minimum=1, maximum=10)
-    assert_rows(text, "### 2.3 强势下降产品", minimum=1, maximum=3)
-    assert_rows(text, "### 2.4 新上榜产品追踪", minimum=1)
-    assert_rows(text, "#### 2.5.1 评分分布与排名关系", expected=3)
-    assert_rows(text, "#### 2.5.2 低分高销产品明细", minimum=1, maximum=10)
+    for chapter, category_name in enumerate(category_names, 2):
+        assert_rows(text, f"#### {chapter}.1.1 TOP10产品", expected=10)
+        assert_rows(text, f"### {chapter}.2 强势上升产品", minimum=1, maximum=10)
+        assert_rows(text, f"### {chapter}.3 强势下降产品", minimum=1, maximum=3)
+        assert_rows(text, f"### {chapter}.4 新上榜产品追踪", minimum=1)
+        assert_rows(text, f"#### {chapter}.5.1 评分分布与排名关系", expected=3)
+        assert_rows(text, f"#### {chapter}.5.2 低分高销产品明细", minimum=1, maximum=10)
 
-    assert_rows(text, "#### 3.1.1 TOP10产品", expected=10)
-    assert_rows(text, "### 3.2 强势上升产品", minimum=1, maximum=10)
-    assert_rows(text, "### 3.3 强势下降产品", minimum=1, maximum=3)
-    assert_rows(text, "### 3.4 新上榜产品追踪", minimum=1)
-    assert_rows(text, "#### 3.5.1 评分分布与排名关系", expected=3)
-    assert_rows(text, "#### 3.5.2 低分高销产品明细", minimum=1, maximum=10)
-
-    assert_marker_table(text, f"#### 4.1.1 {category_a}类目ULANZI产品", minimum=1)
-    assert_marker_table(text, f"#### 4.1.2 {category_b}类目ULANZI产品", minimum=1)
-    assert_marker_table(text, f"**{category_a}**：", expected=15)
-    assert_marker_table(text, f"**{category_b}**：", expected=15)
-    assert_marker_table(text, f"**{category_a}（类目均值：", minimum=1)
-    assert_marker_table(text, f"**{category_b}（类目均值：", minimum=1)
-
-    for category_name in [category_a, category_b]:
-        section = section_after(text, f"#### 4.1.1 {category_name}类目ULANZI产品") if category_name == category_a else section_after(text, f"#### 4.1.2 {category_name}类目ULANZI产品")
+    for index, category_name in enumerate(category_names, 1):
+        marker = f"#### {ulanzi_chapter}.1.{index} {category_name}类目ULANZI产品"
+        assert_marker_table(text, marker, minimum=1)
+        assert_marker_table(text, f"**{category_name}**：", expected=15)
+        assert_marker_table(text, f"**{category_name}（类目均值：", minimum=1)
+        section = section_after(text, marker)
         rows = first_table_rows(section)
         if any("无 ULANZI 产品进入本周 TOP100" in row for row in rows):
             if len(rows) != 1:
                 fail(f"{category_name} ULANZI empty-state table must contain exactly one row")
-        elif not any("ULANZI" in row.upper() for row in rows):
-            fail(f"{category_name} ULANZI table has neither products nor empty-state text")
+        elif not any("https://www.amazon.com/dp/" in row for row in rows):
+            fail(f"{category_name} ULANZI table has neither product links nor empty-state text")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("report", type=Path)
     parser.add_argument("--category", required=True)
-    parser.add_argument("--category-a", required=True)
-    parser.add_argument("--category-b", required=True)
+    parser.add_argument("--category-name", action="append", default=[], help="Leaf category name; repeat 1-4 times")
+    parser.add_argument("--category-a", help="Deprecated two-category compatibility option")
+    parser.add_argument("--category-b", help="Deprecated two-category compatibility option")
     parser.add_argument("--image-width", type=int, default=150)
     args = parser.parse_args()
-    validate(args.report, args.category, args.category_a, args.category_b, image_width=args.image_width)
+    category_names = args.category_name or [name for name in [args.category_a, args.category_b] if name]
+    validate(args.report, args.category, category_names, image_width=args.image_width)
     print(f"VALIDATION_OK: {args.report}")
 
 
