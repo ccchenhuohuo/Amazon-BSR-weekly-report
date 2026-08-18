@@ -19,6 +19,7 @@ from typing import Any
 
 import pymysql
 
+from category_config import load_category_mapping
 from validate_report import validate
 
 
@@ -65,22 +66,18 @@ def read(path: Path) -> str:
 
 
 def parse_mapping() -> dict[str, list[dict[str, str]]]:
-    text = read(SKILL_DIR / "references/category-mapping.md")
-    mapping: dict[str, list[dict[str, str]]] = {}
-    current: str | None = None
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.startswith("## "):
-            current = line[3:].strip()
-            mapping[current] = []
-            continue
-        if not current or not line.startswith("|") or "node_id" in line or "---" in line:
-            continue
-        cells = [c.strip() for c in line.strip("|").split("|")]
-        if len(cells) >= 2 and cells[0] and cells[1]:
-            name = cells[0].split(">")[-1].strip()
-            mapping[current].append({"name": name, "path": cells[0], "node": cells[1]})
-    return mapping
+    """Backward-compatible entrypoint for tests and callers."""
+    return load_category_mapping(SKILL_DIR / "references/category-mapping.md")
+
+
+CHINESE_NUMBERS = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七"}
+
+
+def chinese_number(value: int) -> str:
+    try:
+        return CHINESE_NUMBERS[value]
+    except KeyError as exc:
+        raise ValueError(f"unsupported chapter number: {value}") from exc
 
 
 def parse_date(value: str, today: datetime | None = None) -> str:
@@ -329,11 +326,18 @@ def top_product(row: dict[str, Any]) -> str:
     return f"{cell(row['brand'])} ({asin(row['asin'])})"
 
 
-def render_overview(conn, board_name: str, a: dict[str, str], b: dict[str, str], a_data: dict[str, Any], b_data: dict[str, Any], start_date: str, end_date: str) -> str:
+def render_overview(
+    conn,
+    board_name: str,
+    categories: list[dict[str, str]],
+    data_by_node: dict[str, dict[str, Any]],
+    start_date: str,
+    end_date: str,
+) -> str:
     base = SKILL_DIR / "agents/01-overview/queries"
-    metrics = {}
-    top = {}
-    for category in [a, b]:
+    metrics: dict[str, list[dict[str, Any]]] = {}
+    top: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for category in categories:
         metrics[category["node"]] = qfile(conn, base / "core-metrics.sql", node_id=category["node"], start_date=start_date, end_date=end_date)
         for date in [start_date, end_date]:
             top[(category["node"], date)] = qfile(conn, base / "top3.sql", node_id=category["node"], date=date)
@@ -346,38 +350,57 @@ def render_overview(conn, board_name: str, a: dict[str, str], b: dict[str, str],
         "{报告日期}": end_date,
         "{上周日期}": start_date,
         "{本周日期}": end_date,
-        "{类目A名称}": a["name"],
-        "{类目A完整路径}": a["path"],
-        "{类目A节点ID}": a["node"],
-        "{类目B名称}": b["name"],
-        "{类目B完整路径}": b["path"],
-        "{类目B节点ID}": b["node"],
+        "{类目映射说明}": "\n".join(
+            f"> - **类目{chr(65 + index)} ({category['name']})**：{category['path']}（Node ID: {category['node']}）"
+            for index, category in enumerate(categories)
+        ),
         "{数据来源}": data_source_label(),
     }
     for key, value in replacements.items():
         header = header.replace(key, value)
 
-    rows = []
+    rows: list[list[str]] = []
     for idx in range(3):
-        rows.append([
-            f"**TOP{idx + 1}产品**",
-            top_product(top[(a["node"], start_date)][idx]),
-            top_product(top[(a["node"], end_date)][idx]),
-            top_product(top[(b["node"], start_date)][idx]),
-            top_product(top[(b["node"], end_date)][idx]),
-        ])
-    a_start = metric_for(metrics[a["node"]], start_date)
-    a_end = metric_for(metrics[a["node"]], end_date)
-    b_start = metric_for(metrics[b["node"]], start_date)
-    b_end = metric_for(metrics[b["node"]], end_date)
-    rows += [
-        ["**独立品牌数**", integer(a_start["unique_brands"]), integer(a_end["unique_brands"]), integer(b_start["unique_brands"]), integer(b_end["unique_brands"])],
-        ["**类目月销总量**", integer(a_start["total_monthly_sales"]), integer(a_end["total_monthly_sales"]), integer(b_start["total_monthly_sales"]), integer(b_end["total_monthly_sales"])],
-        ["**类目均价（按销量加权）**", money(a_start["weighted_avg_price"]), money(a_end["weighted_avg_price"]), money(b_start["weighted_avg_price"]), money(b_end["weighted_avg_price"])],
+        row = [f"**TOP{idx + 1}产品**"]
+        for category in categories:
+            row.extend([
+                top_product(top[(category["node"], start_date)][idx]),
+                top_product(top[(category["node"], end_date)][idx]),
+            ])
+        rows.append(row)
+
+    metric_fields = [
+        ("**独立品牌数**", "unique_brands", integer),
+        ("**类目月销总量**", "total_monthly_sales", integer),
+        ("**类目均价（按销量加权）**", "weighted_avg_price", money),
     ]
+    for label, field, formatter in metric_fields:
+        row = [label]
+        for category in categories:
+            start = metric_for(metrics[category["node"]], start_date)
+            end = metric_for(metrics[category["node"]], end_date)
+            row.extend([formatter(start[field]), formatter(end[field])])
+        rows.append(row)
 
     def delta(start: dict[str, Any], end: dict[str, Any], field: str) -> float:
         return float(end[field]) - float(start[field])
+
+    headers = ["指标"]
+    for category in categories:
+        headers.extend([f"{category['name']} ({start_date})", f"{category['name']} ({end_date})"])
+
+    insights: list[str] = []
+    for category in categories:
+        start = metric_for(metrics[category["node"]], start_date)
+        end = metric_for(metrics[category["node"]], end_date)
+        category_data = data_by_node[category["node"]]
+        insights.extend([
+            f"**{category['name']}类目关键洞察**：",
+            f"1. 月销总量较上周变化{delta(start, end, 'total_monthly_sales'):+,.0f}件，独立品牌数变化{delta(start, end, 'unique_brands'):+.0f}个。",
+            f"2. 加权均价较上周变化{delta(start, end, 'weighted_avg_price'):+.2f}美元。",
+            f"3. TOP10头部月销最高产品为{cell(category_data['top10'][0]['brand'])} {asin(category_data['top10'][0]['asin'])}，月销{integer(category_data['top10'][0]['monthly_sales'])}件。",
+            "",
+        ])
 
     return "\n".join([
         header.rstrip(),
@@ -386,27 +409,18 @@ def render_overview(conn, board_name: str, a: dict[str, str], b: dict[str, str],
         "",
         "### 1.1 核心指标对比",
         "",
-        table(["指标", f"{a['name']} ({start_date})", f"{a['name']} ({end_date})", f"{b['name']} ({start_date})", f"{b['name']} ({end_date})"], rows),
+        table(headers, rows),
         "",
         "### 1.2 核心结论",
         "",
-        f"**{a['name']}类目关键洞察**：",
-        f"1. 月销总量较上周变化{delta(a_start, a_end, 'total_monthly_sales'):+,.0f}件，独立品牌数变化{delta(a_start, a_end, 'unique_brands'):+.0f}个。",
-        f"2. 加权均价较上周变化{delta(a_start, a_end, 'weighted_avg_price'):+.2f}美元。",
-        f"3. TOP10头部月销最高产品为{cell(a_data['top10'][0]['brand'])} {asin(a_data['top10'][0]['asin'])}，月销{integer(a_data['top10'][0]['monthly_sales'])}件。",
-        "",
-        f"**{b['name']}类目关键洞察**：",
-        f"1. 月销总量较上周变化{delta(b_start, b_end, 'total_monthly_sales'):+,.0f}件，独立品牌数变化{delta(b_start, b_end, 'unique_brands'):+.0f}个。",
-        f"2. 加权均价较上周变化{delta(b_start, b_end, 'weighted_avg_price'):+.2f}美元。",
-        f"3. TOP10头部月销最高产品为{cell(b_data['top10'][0]['brand'])} {asin(b_data['top10'][0]['asin'])}，月销{integer(b_data['top10'][0]['monthly_sales'])}件。",
-        "",
+        *insights,
     ])
 
 
-def overview_counts(conn, a: dict[str, str], b: dict[str, str], start_date: str, end_date: str) -> dict[str, Any]:
+def overview_counts(conn, categories: list[dict[str, str]], start_date: str, end_date: str) -> dict[str, Any]:
     base = SKILL_DIR / "agents/01-overview/queries"
     counts: dict[str, Any] = {}
-    for category in [a, b]:
+    for category in categories:
         metrics = qfile(conn, base / "core-metrics.sql", node_id=category["node"], start_date=start_date, end_date=end_date)
         if len(metrics) != 2:
             die(f"{category['name']} core metrics expected 2 rows, got {len(metrics)}")
@@ -518,10 +532,13 @@ def rank_ulanzi(brands: list[dict[str, Any]]) -> tuple[int | None, dict[str, Any
     return None, None
 
 
-def render_ulanzi(conn, a: dict[str, str], b: dict[str, str], a_u: dict[str, Any], b_u: dict[str, Any], start_date: str, end_date: str) -> str:
-    summary = qfile(conn, SKILL_DIR / "agents/03-ulanzi/queries/ulanzi-summary.sql", end_date=end_date, category_a_node=a["node"], category_b_node=b["node"])
-    by_node = {row["bsr_category_node"]: row for row in summary}
-
+def render_ulanzi(
+    categories: list[dict[str, str]],
+    ulanzi_by_node: dict[str, dict[str, Any]],
+    start_date: str,
+    end_date: str,
+    chapter_number: int,
+) -> str:
     def products(rows: list[dict[str, Any]]) -> str:
         if not rows:
             return table(["ASIN", "产品名称", f"{start_date}排名", f"{end_date}排名", "排名变化", "价格($)", "评分", "月销(件)", "上架天数", "商品图片"], [["-", "无 ULANZI 产品进入本周 TOP100", "-", "-", "-", "-", "-", "-", "-", "-"]])
@@ -551,86 +568,110 @@ def render_ulanzi(conn, a: dict[str, str], b: dict[str, str], a_u: dict[str, Any
         down = sum(1 for r in rows if r["rank_change"] is not None and int(r["rank_change"]) < 0)
         return [f"- **SKU数量**：{len(rows)}", f"- **最高排名**：{best['this_rank']}", f"- **整体趋势**：{up}个SKU上升，{down}个SKU下降", f"- **表现突出产品**：{asin(best['asin'])}，月销{integer(best['monthly_sales'])}件"]
 
-    def summary_values(category: dict[str, str]) -> list[str]:
-        row = by_node.get(category["node"], {})
-        return [integer(row.get("sku_count", 0)), integer(row.get("total_monthly_sales", 0)), integer(row.get("top10_sku_count", 0)), cell(row.get("avg_rank", "-")), money(row.get("avg_price")) if row else "-"]
+    def summary_values(data: dict[str, Any]) -> dict[str, Any]:
+        rows = data["products"]
+        sales = sum(int(row.get("monthly_sales") or 0) for row in rows)
+        ranks = [int(row["this_rank"]) for row in rows if row.get("this_rank") is not None]
+        prices = [float(row["price"]) for row in rows if row.get("price") is not None]
+        return {
+            "sku_count": len(rows),
+            "total_monthly_sales": sales,
+            "top10_sku_count": sum(1 for rank in ranks if rank <= 10),
+            "avg_rank": (sum(ranks) / len(ranks)) if ranks else None,
+            "avg_price": (sum(prices) / len(prices)) if prices else None,
+            "new_sku_count": sum(1 for row in rows if int(row.get("online_days") or 0) <= 180),
+        }
 
-    a_sum = summary_values(a)
-    b_sum = summary_values(b)
-    total_sku = int(by_node.get(a["node"], {}).get("sku_count", 0) or 0) + int(by_node.get(b["node"], {}).get("sku_count", 0) or 0)
-    total_sales = int(by_node.get(a["node"], {}).get("total_monthly_sales", 0) or 0) + int(by_node.get(b["node"], {}).get("total_monthly_sales", 0) or 0)
-
-    return "\n".join([
-        "## 四、ULANZI本品专题分析",
+    summaries = {category["node"]: summary_values(ulanzi_by_node[category["node"]]) for category in categories}
+    total_sku = sum(summary["sku_count"] for summary in summaries.values())
+    total_sales = sum(summary["total_monthly_sales"] for summary in summaries.values())
+    chapter = str(chapter_number)
+    output: list[str] = [
+        f"## {chinese_number(chapter_number)}、ULANZI本品专题分析",
         "",
         f"数据来源：{data_source_label()}\n分析周期：{start_date} ~ {end_date}",
         "",
         "> **数据口径说明**：",
-        f"> - **TOP100门槛**：{a['name']}最低月销约{integer(a_u['threshold'])}件，{b['name']}最低月销约{integer(b_u['threshold'])}件",
-        f"> - **ULANZI状态**：{a['name']}有{len(a_u['products'])}个产品进入TOP100，{b['name']}有{len(b_u['products'])}个产品进入TOP100",
+        "> - **TOP100门槛**：" + "；".join(
+            f"{category['name']}约{integer(ulanzi_by_node[category['node']]['threshold'])}件"
+            for category in categories
+        ),
+        "> - **ULANZI状态**：" + "；".join(
+            f"{category['name']}有{len(ulanzi_by_node[category['node']]['products'])}个产品进入TOP100"
+            for category in categories
+        ),
         "",
-        "### 4.1 周度产品线明细",
+        f"### {chapter}.1 周度产品线明细",
         "",
-        f"#### 4.1.1 {a['name']}类目ULANZI产品",
+    ]
+    for index, category in enumerate(categories, 1):
+        data = ulanzi_by_node[category["node"]]
+        output.extend([
+            f"#### {chapter}.1.{index} {category['name']}类目ULANZI产品",
+            "",
+            products(data["products"]),
+            "",
+            f"**{category['name']}类目ULANZI表现总结**：",
+            *product_summary(data["products"]),
+            "",
+        ])
+
+    output.extend([
+        f"### {chapter}.2 品牌销售效率全面对比分析",
         "",
-        products(a_u["products"]),
+        f"#### {chapter}.2.1 TOP品牌单品效率排名 ({end_date})",
         "",
-        f"**{a['name']}类目ULANZI表现总结**：",
-        *product_summary(a_u["products"]),
+    ])
+    for category in categories:
+        data = ulanzi_by_node[category["node"]]
+        output.extend([
+            f"**{category['name']}**：",
+            "",
+            brand_table(data["brands"]),
+            "",
+            avg_line(data),
+            "",
+        ])
+
+    output.extend([
+        f"#### {chapter}.2.2 ULANZI内部效率分析",
         "",
-        f"#### 4.1.2 {b['name']}类目ULANZI产品",
-        "",
-        products(b_u["products"]),
-        "",
-        f"**{b['name']}类目ULANZI表现总结**：",
-        *product_summary(b_u["products"]),
-        "",
-        "### 4.2 品牌销售效率全面对比分析",
-        "",
-        f"#### 4.2.1 TOP品牌单品效率排名 ({end_date})",
-        "",
-        f"**{a['name']}**：",
-        "",
-        brand_table(a_u["brands"]),
-        "",
-        avg_line(a_u),
-        "",
-        f"**{b['name']}**：",
-        "",
-        brand_table(b_u["brands"]),
-        "",
-        avg_line(b_u),
-        "",
-        "#### 4.2.2 ULANZI内部效率分析",
-        "",
-        f"**{a['name']}（类目均值：{integer(a_u['avg_sales'])}件/SKU）**：",
-        "",
-        internal(a_u["internal"]),
-        "",
-        f"**{b['name']}（类目均值：{integer(b_u['avg_sales'])}件/SKU）**：",
-        "",
-        internal(b_u["internal"]),
-        "",
-        "#### 4.2.3 跨类目战略洞察",
+    ])
+    for category in categories:
+        data = ulanzi_by_node[category["node"]]
+        output.extend([
+            f"**{category['name']}（类目均值：{integer(data['avg_sales'])}件/SKU）**：",
+            "",
+            internal(data["internal"]),
+            "",
+        ])
+
+    summary_headers = ["指标", *[category["name"] for category in categories], "合计/均值"]
+    summary_rows = [
+        ["**SKU数**", *[integer(summaries[category["node"]]["sku_count"]) for category in categories], integer(total_sku)],
+        ["**月销总额**", *[integer(summaries[category["node"]]["total_monthly_sales"]) for category in categories], integer(total_sales)],
+        ["**TOP10 SKU数**", *[integer(summaries[category["node"]]["top10_sku_count"]) for category in categories], "-"],
+        ["**平均排名**", *[f"{summaries[category['node']]['avg_rank']:.1f}" if summaries[category["node"]]["avg_rank"] is not None else "-" for category in categories], "-"],
+        ["**均价**", *[money(summaries[category["node"]]["avg_price"]) for category in categories], "-"],
+    ]
+    competition_headers = ["对比维度", "ULANZI", *[category["name"] for category in categories]]
+    competition_rows = [
+        ["**单品效率**", "按月销/SKU评估", *[avg_line(ulanzi_by_node[category["node"]]).replace('> **类目均值**：', '') for category in categories]],
+        ["**价格策略**", "以进入TOP100产品均价评估", *[money(summaries[category["node"]]["avg_price"]) for category in categories]],
+        ["**TOP10占比**", "以TOP10 SKU数衡量", *[integer(summaries[category["node"]]["top10_sku_count"]) for category in categories]],
+        ["**新品表现**", "以180天内SKU数量观察", *[integer(summaries[category["node"]]["new_sku_count"]) for category in categories]],
+    ]
+
+    output.extend([
+        f"#### {chapter}.2.3 跨类目战略洞察",
         "",
         "**一、ULANZI品牌整体表现**",
         "",
-        table(["指标", a["name"], b["name"], "合计/均值"], [
-            ["**SKU数**", a_sum[0], b_sum[0], integer(total_sku)],
-            ["**月销总额**", a_sum[1], b_sum[1], integer(total_sales)],
-            ["**TOP10 SKU数**", a_sum[2], b_sum[2], "-"],
-            ["**平均排名**", a_sum[3], b_sum[3], "-"],
-            ["**均价**", a_sum[4], b_sum[4], "-"],
-        ]),
+        table(summary_headers, summary_rows),
         "",
         "**二、跨类目竞争格局对比**",
         "",
-        table(["对比维度", "ULANZI", a["name"], b["name"]], [
-            ["**单品效率**", "按月销/SKU评估", avg_line(a_u).replace('> **类目均值**：', ''), avg_line(b_u).replace('> **类目均值**：', '')],
-            ["**价格策略**", "以进入TOP100产品均价评估", a_sum[4], b_sum[4]],
-            ["**TOP10占比**", "以TOP10 SKU数衡量", a_sum[2], b_sum[2]],
-            ["**新品表现**", "以180天内SKU数量观察", integer(sum(1 for r in a_u["products"] if int(r["online_days"]) <= 180)), integer(sum(1 for r in b_u["products"] if int(r["online_days"]) <= 180))],
-        ]),
+        table(competition_headers, competition_rows),
         "",
         "**三、战略洞察与建议**",
         "",
@@ -641,9 +682,14 @@ def render_ulanzi(conn, a: dict[str, str], b: dict[str, str], a_u: dict[str, Any
         "5. **新品策略**：保持稳定的新品上市节奏，加强新品上市前的测试和准备。",
         "",
     ])
+    return "\n".join(output)
 
 
-def render_summary(a: dict[str, str], b: dict[str, str], a_data: dict[str, Any], b_data: dict[str, Any]) -> str:
+def render_summary(
+    categories: list[dict[str, str]],
+    data_by_node: dict[str, dict[str, Any]],
+    chapter_number: int,
+) -> str:
     def leader(data: dict[str, Any]) -> str:
         return cell(data["top10"][0]["brand"])
 
@@ -657,19 +703,27 @@ def render_summary(a: dict[str, str], b: dict[str, str], a_data: dict[str, Any],
     def first_or_dash(data: dict[str, Any], key: str) -> str:
         return cell(data[key][0]["brand"]) if data[key] else "-"
 
+    rows: list[list[str]] = []
+    metrics = [
+        ("**市场领导者**", leader),
+        ("**TOP3稳定组合**", top3),
+        ("**价格策略成功者**", price_success),
+        ("**表现亮眼品牌**", lambda data: first_or_dash(data, "rising")),
+        ("**失意品牌**", lambda data: first_or_dash(data, "falling")),
+        ("**跌幅最大品牌**", lambda data: first_or_dash(data, "falling")),
+        ("**新晋品牌**", lambda data: first_or_dash(data, "new")),
+    ]
+    for label, renderer in metrics:
+        rows.append([label, *[renderer(data_by_node[category["node"]]) for category in categories]])
+    rows.append([
+        "**品类趋势**",
+        *["头部产品稳定，中后段排名波动需持续观察" for _ in categories],
+    ])
+
     return "\n".join([
-        "## 五、本周市场格局总结",
+        f"## {chinese_number(chapter_number)}、本周市场格局总结",
         "",
-        table(["格局类型", a["name"], b["name"]], [
-            ["**市场领导者**", leader(a_data), leader(b_data)],
-            ["**TOP3稳定组合**", top3(a_data), top3(b_data)],
-            ["**价格策略成功者**", price_success(a_data), price_success(b_data)],
-            ["**表现亮眼品牌**", first_or_dash(a_data, "rising"), first_or_dash(b_data, "rising")],
-            ["**失意品牌**", first_or_dash(a_data, "falling"), first_or_dash(b_data, "falling")],
-            ["**跌幅最大品牌**", first_or_dash(a_data, "falling"), first_or_dash(b_data, "falling")],
-            ["**新晋品牌**", first_or_dash(a_data, "new"), first_or_dash(b_data, "new")],
-            ["**品类趋势**", "头部产品稳定，中后段排名波动明显", "多品牌竞争，低价高销产品密集"],
-        ]),
+        table(["格局类型", *[category["name"] for category in categories]], rows),
         "",
     ])
 
@@ -690,15 +744,13 @@ def preflight() -> None:
 
 def query_counts(
     overview: dict[str, Any],
-    a: dict[str, str],
-    b: dict[str, str],
-    a_data: dict[str, Any],
-    b_data: dict[str, Any],
-    a_u: dict[str, Any],
-    b_u: dict[str, Any],
+    categories: list[dict[str, str]],
+    data_by_node: dict[str, dict[str, Any]],
+    ulanzi_by_node: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     counts = dict(overview)
-    for category, data in [(a, a_data), (b, b_data)]:
+    for category in categories:
+        data = data_by_node[category["node"]]
         prefix = category["name"]
         counts[f"{prefix}.top10"] = len(data["top10"])
         counts[f"{prefix}.rising"] = len(data["rising"])
@@ -706,7 +758,8 @@ def query_counts(
         counts[f"{prefix}.new_entries"] = len(data["new"])
         counts[f"{prefix}.low_rating_high_sales"] = len(data["low"])
         counts[f"{prefix}.rating_distribution"] = len(data["ratings"])
-    for category, data in [(a, a_u), (b, b_u)]:
+    for category in categories:
+        data = ulanzi_by_node[category["node"]]
         prefix = category["name"]
         counts[f"{prefix}.ulanzi_products"] = len(data["products"])
         counts[f"{prefix}.ulanzi_internal"] = len(data["internal"])
@@ -720,7 +773,7 @@ def print_summary(summary: dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--category", required=False, help="支架类、脚架类、灯光类")
+    parser.add_argument("--category", required=False, help="报告方向，例如灯光类、支架类、脚架类、音视频类、智能工作室类")
     parser.add_argument("--date", required=False, help="YYYY-MM-DD or 本周三/上周三/上上周三")
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--check-env", action="store_true", help="Check Doris connection environment variables and exit")
@@ -756,27 +809,40 @@ def main() -> None:
     mapping = parse_mapping()
     if args.category not in mapping:
         die(f"unknown category {args.category}; available: {', '.join(mapping)}")
-    if len(mapping[args.category]) != 2:
-        die(f"{args.category} must map to exactly 2 Sorftime categories")
+    categories = mapping[args.category]
+    if not 1 <= len(categories) <= 4:
+        die(f"{args.category} must map to 1-4 Sorftime categories")
 
     end_date = parse_date(args.date)
     start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
-    a, b = mapping[args.category]
-
     with db_connect() as conn:
-        overview = overview_counts(conn, a, b, start_date, end_date)
-        a_data = fetch_category(conn, a, start_date, end_date)
-        b_data = fetch_category(conn, b, start_date, end_date)
-        a_u = fetch_ulanzi(conn, a, start_date, end_date)
-        b_u = fetch_ulanzi(conn, b, start_date, end_date)
+        overview = overview_counts(conn, categories, start_date, end_date)
+        data_by_node = {
+            category["node"]: fetch_category(conn, category, start_date, end_date)
+            for category in categories
+        }
+        ulanzi_by_node = {
+            category["node"]: fetch_ulanzi(conn, category, start_date, end_date)
+            for category in categories
+        }
+        ulanzi_chapter = len(categories) + 2
+        summary_chapter = ulanzi_chapter + 1
         report = "\n".join([
-            render_overview(conn, args.category, a, b, a_data, b_data, start_date, end_date),
-            render_category("二", "2", a, a_data, end_date),
-            render_category("三", "3", b, b_data, end_date),
-            render_ulanzi(conn, a, b, a_u, b_u, start_date, end_date),
-            render_summary(a, b, a_data, b_data),
+            render_overview(conn, args.category, categories, data_by_node, start_date, end_date),
+            *[
+                render_category(
+                    chinese_number(index + 2),
+                    str(index + 2),
+                    category,
+                    data_by_node[category["node"]],
+                    end_date,
+                )
+                for index, category in enumerate(categories)
+            ],
+            render_ulanzi(categories, ulanzi_by_node, start_date, end_date, ulanzi_chapter),
+            render_summary(categories, data_by_node, summary_chapter),
         ])
-    counts = query_counts(overview, a, b, a_data, b_data, a_u, b_u)
+    counts = query_counts(overview, categories, data_by_node, ulanzi_by_node)
 
     compact_date = end_date.replace("-", "")
     out_path = args.out or args.out_dir / f"{compact_date}{args.category}周趋势监测报告.md"
@@ -786,14 +852,13 @@ def main() -> None:
         with tempfile.TemporaryDirectory(prefix="sorftime-weekly-report-") as tmpdir:
             validation_path = Path(tmpdir) / out_path.name
             validation_path.write_text(report, encoding="utf-8")
-            validate(validation_path, args.category, a["name"], b["name"], image_width=IMAGE_WIDTH)
+            validate(validation_path, args.category, [category["name"] for category in categories], image_width=IMAGE_WIDTH)
         print_summary({
             "status": "DRY_RUN_OK",
             "category": args.category,
             "start_date": start_date,
             "end_date": end_date,
-            "category_a": {"name": a["name"], "node_id": a["node"]},
-            "category_b": {"name": b["name"], "node_id": b["node"]},
+            "categories": [{"name": category["name"], "node_id": category["node"]} for category in categories],
             "target_path": str(out_path),
             "output_path": None,
             "dry_run": True,
@@ -824,7 +889,7 @@ def main() -> None:
         ) as temp_file:
             temp_file.write(report)
             temp_path = Path(temp_file.name)
-        validate(temp_path, args.category, a["name"], b["name"], image_width=IMAGE_WIDTH)
+        validate(temp_path, args.category, [category["name"] for category in categories], image_width=IMAGE_WIDTH)
         os.replace(temp_path, out_path)
         temp_path = None
     finally:
@@ -835,8 +900,7 @@ def main() -> None:
         "category": args.category,
         "start_date": start_date,
         "end_date": end_date,
-        "category_a": {"name": a["name"], "node_id": a["node"]},
-        "category_b": {"name": b["name"], "node_id": b["node"]},
+        "categories": [{"name": category["name"], "node_id": category["node"]} for category in categories],
         "target_path": str(target_path),
         "output_path": str(out_path),
         "dry_run": False,

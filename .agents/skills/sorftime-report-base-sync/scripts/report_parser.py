@@ -5,8 +5,19 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+WEEKLY_REPORT_SCRIPTS_DIR = (
+    PROJECT_ROOT / ".agents" / "skills" / "sorftime-weekly-report" / "scripts"
+)
+if str(WEEKLY_REPORT_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(WEEKLY_REPORT_SCRIPTS_DIR))
+
+from category_config import load_category_mapping
 
 
 REQUIRED_TABLES = [
@@ -28,9 +39,8 @@ REQUIRED_TABLES = [
 ]
 
 CATEGORY_MAP = {
-    "灯光类": ("Continuous Output Lighting", "Selfie Lights"),
-    "支架类": ("Cradles", "Grips"),
-    "脚架类": ("Complete Tripods", "Tripods"),
+    group: tuple(category["name"] for category in categories)
+    for group, categories in load_category_mapping().items()
 }
 
 MOVEMENT_SECTIONS = {

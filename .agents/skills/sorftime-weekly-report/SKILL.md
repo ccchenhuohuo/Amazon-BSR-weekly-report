@@ -206,12 +206,14 @@ python3 scripts/generate_weekly_report.py --preflight
 python3 scripts/generate_weekly_report.py --check-env
 ```
 
-### 三类目 dry-run
+### 五个报告方向 dry-run
 
 ```bash
 python3 scripts/generate_weekly_report.py --category 支架类 --date 2026-04-22 --dry-run
 python3 scripts/generate_weekly_report.py --category 脚架类 --date 2026-04-22 --dry-run
 python3 scripts/generate_weekly_report.py --category 灯光类 --date 2026-04-22 --dry-run
+python3 scripts/generate_weekly_report.py --category 音视频类 --date 2026-04-22 --dry-run
+python3 scripts/generate_weekly_report.py --category 智能工作室类 --date 2026-04-22 --dry-run
 ```
 
 ### 真实落盘与校验

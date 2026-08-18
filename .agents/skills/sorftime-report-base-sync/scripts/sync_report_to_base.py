@@ -85,6 +85,18 @@ STATIC_FOLDER_TABLES = {
 }
 
 
+def base_template_shape_error(report_category: str) -> str | None:
+    categories = CATEGORY_MAP[report_category]
+    expected = len(CATEGORY_FOLDER_PLACEHOLDERS)
+    if len(categories) == expected:
+        return None
+    return (
+        f"{report_category} contains {len(categories)} leaf categories, but the current Base "
+        f"template supports exactly {expected}. Regenerate a compatible Base template and "
+        "update its table/folder mappings before enabling Base sync."
+    )
+
+
 def redact_cli_args(args: list[str]) -> list[str]:
     redacted = list(args)
     for idx, value in enumerate(redacted[:-1]):
@@ -432,6 +444,9 @@ def rename_category_folders(
     *,
     dry_run: bool,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    shape_error = base_template_shape_error(report_category)
+    if shape_error:
+        raise SyncError(shape_error)
     categories = CATEGORY_MAP[report_category]
     blocks = list_base_blocks(base_token)
     folders = resolve_category_folders(blocks, categories)
@@ -1222,6 +1237,9 @@ def main() -> int:
         if not args.report.exists():
             raise SyncError(f"Report not found: {args.report}")
         report_category = infer_report_category(args.report, args.category)
+    shape_error = base_template_shape_error(report_category)
+    if shape_error:
+        raise SyncError(shape_error)
     categories = CATEGORY_MAP[report_category]
 
     run_id = f"{report_date}-{report_category}-{int(time.time())}"

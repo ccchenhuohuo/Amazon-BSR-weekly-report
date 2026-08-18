@@ -5,7 +5,7 @@
 - 执行时间：每周五 17:00，按 Asia/Shanghai 时间理解。
 - Codex cron RRULE：`FREQ=WEEKLY;BYDAY=FR;BYHOUR=17;BYMINUTE=0;BYSECOND=0`。
 - 报告日期：取运行时最近一个已经结束的周三。周五 17:00 运行时，通常使用本周三。
-- 执行范围：`灯光类`、`支架类`、`脚架类` 三个报告类目。
+- 执行范围：`灯光类`、`支架类`、`脚架类`、`音视频类`、`智能工作室类` 五个报告方向，共 12 个叶子类目。
 - 日志位置：项目 `logs/` 或各 skill-local `logs/`，不要把运行产物写到 `.agents/skills` 根目录。
 
 ## 推荐入口
@@ -33,6 +33,8 @@
 
 runner 只负责编排日期、顺序、Base 复制、命令执行和摘要汇总；BSR 同步、周报生成、Base 同步的业务逻辑仍由各自 skill 维护。生产运行时，runner 会在缺少某类目 Base token 时使用 `FEISHU_TEMPLATE_BASE_TOKEN` 或 `--template-base-token <BASE_TOKEN>` 指向的模板 Base 复制结构，复制后的新 token 只在进程内继续用于该类目的 Base sync。`--base-token 类目=<token>` 只作为重跑或排障时的显式覆盖。Base sync 成功后，runner 会在对应 Base 左侧栏新增一份 docx 文档，并把本类目的周报正文写入该 Base 内文档。
 
+> 当前扩展配置下，每个报告方向包含 1、3 或 4 个叶子类目，而旧 Base 模板固定只有两个类目文件夹和两套章节子表。runner 会在任何 Base/飞书写操作之前失败并说明不兼容；在新模板及表映射完成前，只能使用 `--skip-base-sync` 验证 BSR 与 Markdown 周报链路。
+
 dry-run 不会真实复制 Base，因此只能校验复制请求和命名是否正确；没有真实新 token 时，后续 Base sync 会跳过。若要完整校验 Base sync，可临时传入已有测试 Base token。dry-run 默认不发送飞书完成通知；需要测试通知时显式加 `--notify-dry-run`。
 
 ## Skill 串联顺序
@@ -43,7 +45,7 @@ dry-run 不会真实复制 Base，因此只能校验复制请求和命名是否�
 
 目标：
 
-- 对三类报告涉及的所有 Sorftime 类目同步 report_date 的 Top100 BSR 数据到 Doris。
+- 对五个报告方向涉及的 12 个 Sorftime 叶子类目同步 report_date 的 Top100 BSR 数据到 Doris。
 - 必须先删后写，避免 `DUPLICATE KEY(asin, bsr_date)` append-only 重复写入。
 - 默认同步周三数据，可通过 `--weekday wednesday`、`TARGET_WEEKDAY=wednesday` 或显式 `--dates <report_date>` 实现。
 
@@ -59,13 +61,13 @@ TARGET_WEEKDAY=wednesday .agents/skills/sorftime-bsr-sync/scripts/bsr_sync_weekl
 - 失败类目必须重试或在最终汇报中列出。
 - 不允许在未确认清理旧数据的情况下重复追加。
 
-### 2. 三类目周报生成
+### 2. 五个报告方向周报生成
 
 使用 `sorftime-weekly-report`。
 
 目标：
 
-- 分别生成 `灯光类`、`支架类`、`脚架类` 的 Markdown 周趋势监测报告。
+- 分别生成 `灯光类`、`支架类`、`脚架类`、`音视频类`、`智能工作室类` 的 Markdown 周趋势监测报告。
 - 默认输出到项目 `reports/` 目录；生产环境可通过 `SORFTIME_REPORT_OUTPUT_DIR` 或 runner 的 `--report-dir` 指向 Obsidian 历史周报目录：
 
 ```text
@@ -78,23 +80,25 @@ ${SORFTIME_REPORT_OUTPUT_DIR}/{YYYYMMDD}{类目}周趋势监测报告.md
 python3 .agents/skills/sorftime-weekly-report/scripts/generate_weekly_report.py --category 灯光类 --date <report_date> --overwrite
 python3 .agents/skills/sorftime-weekly-report/scripts/generate_weekly_report.py --category 支架类 --date <report_date> --overwrite
 python3 .agents/skills/sorftime-weekly-report/scripts/generate_weekly_report.py --category 脚架类 --date <report_date> --overwrite
+python3 .agents/skills/sorftime-weekly-report/scripts/generate_weekly_report.py --category 音视频类 --date <report_date> --overwrite
+python3 .agents/skills/sorftime-weekly-report/scripts/generate_weekly_report.py --category 智能工作室类 --date <report_date> --overwrite
 ```
 
 验收：
 
-- 运行 `validate_report.py` 校验三份报告。
+- 运行 `validate_report.py` 校验五份报告。
 - 价格必须按美分转美元。
 - SQL 排名字段必须使用 `bsr_rank`。
 - 不允许保留“数据待补充”等占位内容。
 - ULANZI 0 SKU 是合法状态，但报告必须明确写出无产品进入 TOP100。
 
-### 3. 报告数据同步到飞书 Base
+### 3. 报告数据同步到飞书 Base（当前受模板结构阻塞）
 
 使用 `sorftime-report-base-sync`，涉及 Base 操作时同时使用 `lark-base`。
 
 目标：
 
-- 为三份报告复制或准备目标 Base。
+- 新 Base 模板完成 1–4 个叶子类目的动态分组、子表和字段映射后，再为五份报告复制或准备目标 Base。
 - 将报告中的带图商品表同步到三张母表和 12 张子表。
 - 校验目标 Base 的 grid 视图集合与字段顺序完全沿用模板；模板没有筛选视图，因此脚本不得创建筛选视图。
 

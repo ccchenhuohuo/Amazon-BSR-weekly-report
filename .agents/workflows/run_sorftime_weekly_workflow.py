@@ -24,6 +24,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_DIR = Path(__file__).resolve().parent
 if str(WORKFLOW_DIR) not in sys.path:
     sys.path.insert(0, str(WORKFLOW_DIR))
+WEEKLY_REPORT_SCRIPTS_DIR = (
+    PROJECT_ROOT / ".agents" / "skills" / "sorftime-weekly-report" / "scripts"
+)
+if str(WEEKLY_REPORT_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(WEEKLY_REPORT_SCRIPTS_DIR))
 
 import command_runner as command_runner_module
 from command_runner import (
@@ -43,10 +48,13 @@ from command_runner import (
     run_command,
 )
 from publication_registry import PublicationRegistry, PublicationRegistryError
+from category_config import load_category_mapping
 
 DEFAULT_REPORT_DIR = PROJECT_ROOT / "reports"
 DEFAULT_PUBLICATION_STATE = PROJECT_ROOT / "state" / "publications.json"
-CATEGORIES = ("灯光类", "支架类", "脚架类")
+CATEGORY_MAPPING = load_category_mapping()
+CATEGORIES = tuple(CATEGORY_MAPPING)
+BASE_TEMPLATE_LEAF_COUNT = 2
 DEFAULT_FEISHU_WEB_ORIGIN = "https://ulanzichina.feishu.cn"
 LARK_CLI_BIN = "lark-cli"
 FRONT_MATTER_PATTERN = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.DOTALL)
@@ -115,12 +123,24 @@ def required_runtime_paths() -> list[Path]:
     return [
         Path(".agents/workflows/command_runner.py"),
         Path(".agents/workflows/publication_registry.py"),
+        Path(".agents/skills/sorftime-bsr-sync/references/bsr-category-list.md"),
         Path(".agents/skills/sorftime-bsr-sync/scripts/sorftime_api/category/CategoryRequest/fill_missing.py"),
+        Path(".agents/skills/sorftime-weekly-report/references/category-mapping.md"),
+        Path(".agents/skills/sorftime-weekly-report/scripts/category_config.py"),
         Path(".agents/skills/sorftime-weekly-report/scripts/generate_weekly_report.py"),
         Path(".agents/skills/sorftime-weekly-report/scripts/validate_report.py"),
         Path(".agents/skills/sorftime-report-base-sync/scripts/sync_report_to_base.py"),
         Path(".agents/skills/sorftime-report-base-sync/scripts/report_parser.py"),
     ]
+
+
+def base_template_incompatibilities() -> dict[str, int]:
+    """Return report groups that cannot fit the current two-folder Base template."""
+    return {
+        group: len(categories)
+        for group, categories in CATEGORY_MAPPING.items()
+        if len(categories) != BASE_TEMPLATE_LEAF_COUNT
+    }
 
 
 def dependency_import_status() -> dict[str, bool]:
@@ -191,6 +211,29 @@ def run_preflight_checks(args: argparse.Namespace) -> list[StepResult]:
             "preflight:python-dependencies",
             "failed" if missing_dependencies else "ok",
             detail={"imports": dependency_status, "missing": missing_dependencies},
+        )
+    )
+
+    incompatible_groups = base_template_incompatibilities()
+    results.append(
+        StepResult(
+            "preflight:base-template-shape",
+            "ok" if args.skip_base_sync or not incompatible_groups else "failed",
+            detail={
+                "skip_base_sync": args.skip_base_sync,
+                "required_leaf_count": BASE_TEMPLATE_LEAF_COUNT,
+                "configured_leaf_counts": {
+                    group: len(categories) for group, categories in CATEGORY_MAPPING.items()
+                },
+                "incompatible_groups": incompatible_groups,
+                "reason": (
+                    "Base sync skipped"
+                    if args.skip_base_sync
+                    else "Current Base template supports exactly two leaf categories per report group"
+                    if incompatible_groups
+                    else "All report groups match the current Base template"
+                ),
+            },
         )
     )
 
@@ -1343,6 +1386,17 @@ def main() -> int:
         publication_registry = PublicationRegistry(publication_state_path)
         publication_registry.acquire_lock()
         publication_registry.load()
+        incompatible_groups = base_template_incompatibilities()
+        if not args.skip_base_sync and incompatible_groups:
+            details = ", ".join(
+                f"{group}={count}" for group, count in incompatible_groups.items()
+            )
+            raise ValueError(
+                "Current Base template supports exactly two leaf categories per report group, "
+                f"but configured groups are incompatible: {details}. "
+                "Use --skip-base-sync for report-only verification, or redesign the Base template "
+                "before enabling Base sync."
+            )
         if args.no_overwrite_reports and not args.skip_base_sync:
             raise ValueError("--no-overwrite-reports cannot be used while Base sync is enabled")
     except (ValueError, OSError, json.JSONDecodeError, PublicationRegistryError) as exc:

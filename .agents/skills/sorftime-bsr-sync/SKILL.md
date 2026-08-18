@@ -194,7 +194,7 @@ python3 fill_missing.py --parallel
 
 ## 类目清单
 
-从 `references/bsr-category-list.md` 读取，包含：脚架类、支架类、灯光类共 6 个类目。
+从 `references/bsr-category-list.md` 读取。当前配置为灯光、支架、脚架、音视频、智能工作室 5 个报告方向，共 12 个叶子类目；同步入口按 Node ID 去重后逐类处理。
 
 ## 架构说明
 

@@ -53,6 +53,12 @@ pip-audit -r requirements.lock  # if pip-audit is installed and requirements.loc
 connect to Doris. Full report dry-runs require valid Doris credentials because
 they execute the report queries.
 
+The local category mapping currently contains five report groups and twelve
+leaf categories. The existing Feishu Base template only supports two leaf
+categories per report. The runner therefore fails closed before any Base write
+unless Base sync is skipped. Use `--skip-base-sync` for local BSR/report
+validation until a compatible dynamic Base template is implemented.
+
 ## Production Run
 
 The project runner is the recommended entry point:
@@ -134,7 +140,7 @@ The automation prompt should reference
 order:
 
 1. Sync Wednesday BSR data.
-2. Generate the three category Markdown reports.
+2. Generate the five report-group Markdown reports from twelve leaf categories.
 3. Reuse registered Feishu Bases or copy from the template when missing.
 4. Sync each report to Feishu Base with overwrite snapshots and verification.
 5. Reuse or create the weekly report docx inside each Base sidebar, then update it.

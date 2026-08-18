@@ -15,6 +15,27 @@ sys.modules[spec.name] = runner
 spec.loader.exec_module(runner)
 
 
+def use_legacy_three_category_base(monkeypatch):
+    """Keep legacy Base-publication tests focused on the old 2-folder template."""
+    categories = ("灯光类", "支架类", "脚架类")
+    mapping = {
+        "灯光类": (
+            {"name": "Continuous Output Lighting", "node_id": "3347881"},
+            {"name": "Selfie Lights", "node_id": "23658829011"},
+        ),
+        "支架类": (
+            {"name": "Cradles", "node_id": "7072562011"},
+            {"name": "Grips", "node_id": "21209098011"},
+        ),
+        "脚架类": (
+            {"name": "Complete Tripods", "node_id": "499310"},
+            {"name": "Tripods", "node_id": "11139610011"},
+        ),
+    }
+    monkeypatch.setattr(runner, "CATEGORIES", categories)
+    monkeypatch.setattr(runner, "CATEGORY_MAPPING", mapping)
+
+
 def test_report_path_uses_configured_report_dir(tmp_path):
     assert runner.report_path(date(2026, 6, 17), "灯光类", tmp_path) == tmp_path / "20260617灯光类周趋势监测报告.md"
 
@@ -131,7 +152,7 @@ def test_runner_dry_run_writes_summary_and_report(tmp_path, monkeypatch):
     assert run_report_path.exists()
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["dry_run"] is True
-    assert [item["status"] for item in summary["results"]] == ["skipped", "skipped", "skipped", "skipped"]
+    assert [item["status"] for item in summary["results"]] == ["skipped"] * (len(runner.CATEGORIES) + 1)
     assert summary["results"][-1]["name"] == "notify:feishu"
 
 
@@ -296,6 +317,7 @@ def test_preflight_force_new_publication_ignores_registry_tokens(tmp_path, monke
 
 
 def test_runner_main_full_publish_path_sends_notification(tmp_path, monkeypatch):
+    use_legacy_three_category_base(monkeypatch)
     monkeypatch.setattr(runner, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(
         sys,
@@ -402,6 +424,7 @@ def test_runner_main_full_publish_path_sends_notification(tmp_path, monkeypatch)
 
 
 def test_runner_reuses_publication_registry_base_and_doc(tmp_path, monkeypatch):
+    use_legacy_three_category_base(monkeypatch)
     monkeypatch.setattr(runner, "PROJECT_ROOT", tmp_path)
     state_path = tmp_path / "state" / "publications.json"
     state_path.parent.mkdir()
@@ -511,6 +534,7 @@ def test_runner_reuses_publication_registry_base_and_doc(tmp_path, monkeypatch):
 
 
 def test_runner_explicit_base_token_does_not_reuse_registry_doc(tmp_path, monkeypatch):
+    use_legacy_three_category_base(monkeypatch)
     monkeypatch.setattr(runner, "PROJECT_ROOT", tmp_path)
     state_path = tmp_path / "state" / "publications.json"
     state_path.parent.mkdir()
@@ -1187,7 +1211,7 @@ def test_build_success_notification_message_uses_settled_template(tmp_path):
 
     assert "【Amazon BSR 战略周报】已完成" in message
     assert "报告日期：2026-06-24" in message
-    assert "运行结果：3/3 类目成功" in message
+    assert f"运行结果：{len(runner.CATEGORIES)}/{len(runner.CATEGORIES)} 类目成功" in message
     assert "完成时间：2026-06-27 20:14:57 CST" in message
     assert "灯光类：[多维表格](https://ulanzichina.feishu.cn/base/灯光类-base)" in message
     assert "[周报文档](https://ulanzichina.feishu.cn/docx/灯光类-doc)" in message
@@ -1229,7 +1253,7 @@ def test_skipped_category_step_uses_abnormal_notification(tmp_path):
     )
 
     assert "【Amazon BSR 战略周报】运行异常" in message
-    assert "运行结果：2/3 类目成功" in message
+    assert f"运行结果：{len(runner.CATEGORIES) - 1}/{len(runner.CATEGORIES)} 类目成功" in message
     assert "失败环节：base-doc-update:脚架类" in message
 
 
@@ -1373,6 +1397,7 @@ def test_send_workflow_notification_can_require_recipient(tmp_path):
 
 
 def test_missing_report_file_makes_base_sync_fail(tmp_path, monkeypatch):
+    use_legacy_three_category_base(monkeypatch)
     monkeypatch.setattr(runner, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(
         sys,

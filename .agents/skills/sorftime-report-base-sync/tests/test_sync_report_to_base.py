@@ -63,6 +63,14 @@ def table_ids():
     return {name: f"tbl-{name}" for name in sync_report_to_base.REQUIRED_TABLES}
 
 
+def use_two_category_light_mapping(monkeypatch):
+    monkeypatch.setitem(
+        sync_report_to_base.CATEGORY_MAP,
+        "灯光类",
+        ("Continuous Output Lighting", "Selfie Lights"),
+    )
+
+
 def test_adapts_own_table_template_rank_placeholders_to_report_dates():
     template_visible = [
         "ASIN",
@@ -286,6 +294,7 @@ def test_validate_block_layout_accepts_template_category_folders():
 
 
 def test_rename_category_folders_updates_placeholder_names(monkeypatch):
+    use_two_category_light_mapping(monkeypatch)
     state = {"blocks": block_fixture()}
 
     def fake_run_cli(args, dry_run=False, allow_failure=False):
@@ -313,6 +322,7 @@ def test_rename_category_folders_updates_placeholder_names(monkeypatch):
 
 
 def test_rename_category_folders_is_idempotent(monkeypatch):
+    use_two_category_light_mapping(monkeypatch)
     state = {"blocks": block_fixture("Continuous Output Lighting", "Selfie Lights")}
 
     def fake_run_cli(args, dry_run=False, allow_failure=False):
@@ -329,6 +339,7 @@ def test_rename_category_folders_is_idempotent(monkeypatch):
 
 
 def test_rename_category_folders_dry_run_reports_planned(monkeypatch):
+    use_two_category_light_mapping(monkeypatch)
     state = {"blocks": block_fixture()}
     rename_calls = []
 
@@ -352,6 +363,7 @@ def test_rename_category_folders_dry_run_reports_planned(monkeypatch):
 
 
 def test_rename_category_folders_marks_missing_scope(monkeypatch):
+    use_two_category_light_mapping(monkeypatch)
     state = {"blocks": block_fixture()}
 
     def fake_run_cli(args, dry_run=False, allow_failure=False):

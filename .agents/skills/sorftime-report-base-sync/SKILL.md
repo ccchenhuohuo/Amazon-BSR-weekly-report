@@ -55,7 +55,7 @@ python3 .agents/skills/sorftime-report-base-sync/scripts/sync_report_to_base.py 
 
 - `--report`：本地 Markdown/Obsidian 报告路径。
 - `--base-token`：目标 Base token。若用户只给模板 Base，应先用 `lark-cli base +base-copy --without-content` 复制空结构，再把新 token 传给脚本。
-- `--category`：`灯光类`、`支架类`、`脚架类`；可省略，脚本会从文件名推断。
+- `--category`：`灯光类`、`支架类`、`脚架类`、`音视频类`、`智能工作室类`；可省略，脚本会从文件名推断。
 - `--date`：报告日期，格式 `YYYY-MM-DD`。
 - `--previous-date`：上周日期，默认 `--date - 7 days`。
 - `--overwrite`：先删除 15 张目标表已有记录，再重写。重跑或修复失败同步时必须加。
@@ -78,25 +78,17 @@ python3 .agents/skills/sorftime-report-base-sync/scripts/sync_report_to_base.py 
 - 对 `lark-cli` 偶发网络 timeout 做有限重试。
 - 在 `logs/sorftime-report-base-sync/` 下保存本次解析摘要和批量写入 payload。
 
-## 类目映射
+## 类目映射与当前模板限制
 
-| 报告类目 | 章节二类目 | 章节三类目 |
-| --- | --- | --- |
-| 灯光类 | Continuous Output Lighting | Selfie Lights |
-| 支架类 | Cradles | Grips |
-| 脚架类 | Complete Tripods | Tripods |
+完整映射以 `../sorftime-weekly-report/references/category-mapping.md` 为唯一来源，当前为 5 个报告方向、12 个叶子类目。
+
+旧 Base 模板固定只有 `{类目1}`、`{类目2}` 两个文件夹以及两套章节子表，无法承载当前每组 1、3 或 4 个叶子类目的结构。脚本会在读取或写入 Base 之前主动失败；不得绕过该门控。必须先重做 Base 模板及表/文件夹映射，再恢复 Base 同步。
 
 ## 表分组/文件夹名称
 
 模板 Base 左侧表列表里有两个表分组/文件夹占位名：`{类目1}`、`{类目2}`。这些名称不是数据表名，`lark-cli base +table-list` 不返回它们；新版 `lark-cli base +base-block-list` 会以 `type=folder` 返回这些资源，并可用 `+base-block-rename` 重命名。
 
-复制模板并完成脚本同步后，生产自动化应优先用 CLI 将它们改成类目映射中的章节二/章节三类目：
-
-| 报告类目 | `{类目1}` 应改为 | `{类目2}` 应改为 |
-| --- | --- | --- |
-| 灯光类 | Continuous Output Lighting | Selfie Lights |
-| 支架类 | Cradles | Grips |
-| 脚架类 | Complete Tripods | Tripods |
+下面的两个文件夹重命名流程仅适用于旧的双叶子类目模板，保留用于兼容测试；不得用于当前扩展配置。
 
 操作建议：
 
