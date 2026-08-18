@@ -44,3 +44,17 @@ def test_run_command_timeout_kills_process_group(monkeypatch):
     assert killed_groups == [(4321, command_runner.signal.SIGKILL)]
     assert result.status == "failed"
     assert "timed out" in result.stderr
+
+
+def test_redact_detail_keeps_sensitive_parent_key_for_lists():
+    value = {
+        "base_tokens": ["base_real_token"],
+        "tokens": [{"value": "nested_real_token"}],
+        "doc_urls": ["https://ulanzichina.feishu.cn/docx/real_doc_token"],
+    }
+
+    assert command_runner.redact_detail(value) == {
+        "base_tokens": ["[REDACTED]"],
+        "tokens": [{"value": "[REDACTED]"}],
+        "doc_urls": ["[REDACTED]"],
+    }

@@ -99,14 +99,18 @@ def redact_command(command: list[str] | None) -> list[str] | None:
     return [redact_output_text(part) for part in redacted]
 
 
-def redact_detail(value: object, key: str = "") -> object:
+def redact_detail(value: object, key: str = "", inherited_sensitive: bool = False) -> object:
     lowered = key.lower()
+    sensitive = inherited_sensitive or any(part in lowered for part in SECRET_KEY_PARTS)
     if isinstance(value, dict):
-        return {item_key: redact_detail(item_value, item_key) for item_key, item_value in value.items()}
+        return {
+            item_key: redact_detail(item_value, item_key, sensitive)
+            for item_key, item_value in value.items()
+        }
     if isinstance(value, list):
-        return [redact_detail(item) for item in value]
+        return [redact_detail(item, key, sensitive) for item in value]
     if isinstance(value, str):
-        if any(part in lowered for part in SECRET_KEY_PARTS):
+        if sensitive:
             return "[REDACTED]" if value else value
         return redact_output_text(value)
     return value

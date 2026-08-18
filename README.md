@@ -44,6 +44,9 @@ python3 .agents/skills/sorftime-bsr-sync/scripts/sorftime_api/category/CategoryR
 python3 .agents/workflows/run_sorftime_weekly_workflow.py --preflight
 python3 .agents/workflows/run_sorftime_weekly_workflow.py --date 2026-06-17 --dry-run --skip-bsr --skip-report --skip-base-sync
 pytest
+# Optional observability baselines; no minimum threshold is enforced here.
+pytest --cov=.agents --cov-report=term-missing
+pip-audit -r requirements.lock  # if pip-audit is installed and requirements.lock is present
 ```
 
 `--preflight` verifies project-local templates and mapping files. It does not
